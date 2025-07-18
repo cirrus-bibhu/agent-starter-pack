@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Following Up on Your Application</title>
+</head>
+<body>
+    <p>Hi {{ candidate_name }},</p>
+    <p>Thank you for your interest in the position. To proceed with your application, we need a few more details:</p>
+    <ul>
+        {% if not linkedin_url %}
+        <li>Your LinkedIn profile URL</li>
+        {% endif %}
+        {% if not education.bachelors %}
+        <li>Your Bachelor's degree details (university, major, graduation year)</li>
+        {% endif %}
+        {% if not education.masters %}
+        <li>Your Master's degree details (university, major, graduation year)</li>
+        {% endif %}
+        {% if not dob %}
+        <li>Your Date of Birth</li>
+        {% endif %}
+    </ul>
+    <p>Please reply to this email with the missing information.</p>
+    <p>Best regards,</p>
+    <p>MyHiringPartner.ai</p>
+</body>
+</html>
