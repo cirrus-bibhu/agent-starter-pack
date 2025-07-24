@@ -15,32 +15,125 @@ from google.api_core import exceptions
 logger = logging.getLogger('Agent.VerificationManager')
 
 class VerificationManagerAgent(BaseAgent):
-    VERIFICATION_PROMPT = """You are a world-class resume verification expert. Your task is to conduct a comprehensive analysis of a candidate's resume and LinkedIn profile to identify discrepancies, gaps, and inconsistencies. You will be provided with the candidate's resume and LinkedIn data in JSON format.
+    AI_FABRICATED_RESUME_VERIFICATION_PROMPT = """You are a world-class resume fraud detection expert. Your task is to conduct a forensic analysis of a candidate's resume to identify signs of fabrication, AI generation, or fraudulent claims.
 
 **Analysis Dimensions:**
 
-1.  **Discrepancy Analysis:**
-    *   **LinkedIn vs. Resume:** Compare job titles, companies, and dates. Note any differences.
-    *   **Experience Plausibility:** Assess if skills and experience align. Flag exaggerated claims.
-    *   **Education Consistency:** Check for matching degrees, institutions, and dates.
+1.  **Authenticity and Fabrication Analysis:**
+    *   **Content Scrutiny:** Scrutinize the resume for common red flags of fabrication:
+        *   **Academic Experience as Work:** Identifying academic projects, university coursework, or degrees being misrepresented as professional work experience.
+        *   **Vague & Generic Content:** Job descriptions are overly generic, full of buzzwords, and lack specific, measurable achievements.
+        *   **Unrealistic Progression:** A perfectly linear career path with no gaps, overlaps, or logical setbacks.
+        *   **Fully Fabricated History:** The entire work history appears implausible or invented.
+    *   **Timeline Plausibility:** Check for major logical flaws, such as a late graduation age that is inconsistent with the claimed experience, without any alternate explanation.
 
-2.  **Timeline & Gap Analysis:**
-    *   Construct a career timeline from all available dates.
-    *   Identify and report any unexplained employment gaps of 6 months or more, providing start dates, end dates, and estimated duration.
-
-3.  **Metrics & Summary:**
-    *   List all identified inconsistencies and any significant missing information.
-    *   Provide a brief overall summary of your findings.
+2.  **Final Verdict Guidance (Strict):**
+    *   **Reject the candidate for clear signs of fabrication:**
+        *   The resume misrepresents academic achievements (e.g., a Master's degree) as professional work experience.
+        *   The work history is clearly fabricated, containing generic descriptions and lacking verifiable details.
+        *   The entire profile is logically inconsistent and appears to be fake.
 
 **Output Format:**
 
-Return your analysis as a single JSON object. Ensure all date fields are in 'YYYY-MM-DD' format.
+Return your analysis as a single JSON object. Focus the 'discrepancies' on authenticity and fabrication concerns.
 
 ```json
 {{
   "discrepancies": [
     {{
-      "type": "LinkedIn Comparison | Experience Plausibility | Education Verification",
+      "type": "Authenticity Concern | Fabricated Experience",
+      "description": "Red Flag: Candidate's Master's Degree period is counted as professional work experience.",
+      "severity": "high"
+    }}
+  ],
+  "gaps_in_experience": [],
+  "final_verdict": "Proceed | Reject",
+  "verdict_reason": "Resume is likely fabricated. It misrepresents academic qualifications as professional experience."
+}}
+```
+
+**Candidate Data:**
+
+**Resume (JSON):**
+{{resume_json}}
+
+{{linkedin_section}}
+"""
+
+    EDUCATION_TIMELINE_VERIFICATION_PROMPT = """You are a world-class resume verification expert. Your task is to conduct a focused analysis of a candidate's education and career timeline for plausibility and coherence.
+
+**Analysis Dimensions:**
+
+1.  **Education & Timeline Plausibility Analysis:**
+    *   **Education Verification:**
+        *   Compare the education details (degrees, institutions, dates) on the resume with LinkedIn.
+        *   If a Master's degree is listed, verify that a Bachelor's degree is also present and that the timeline between them is logical. Flag if the Bachelor's degree is missing.
+    *   **Timeline Coherence:** Analyze the relationship between education and work timelines. Flag inconsistencies such as:
+        *   Full-time work experience overlapping with full-time education periods (e.g., starting a job in 2012 but claiming a Master's degree completed in 2014).
+        *   Professional work experience starting significantly before the completion of a foundational degree (e.g., Bachelor's in 2017, but experience starting in 2015).
+    *   **Age and Experience Plausibility:** Assess if the claimed graduation age and career progression are realistic. Flag anomalies like an unusually late graduation age without a clear explanation.
+
+2.  **Final Verdict Guidance (Strict):**
+    *   **Reject the candidate for critical timeline inconsistencies:**
+        *   The timeline is illogical (e.g., holding a full-time senior role before completing a Bachelor's degree) without any reasonable explanation.
+        *   A claimed degree's timeline directly and inexplicably conflicts with the work history provided.
+
+**Output Format:**
+
+Return your analysis as a single JSON object. Focus the 'discrepancies' on timeline and education issues.
+
+```json
+{{
+  "discrepancies": [
+    {{
+      "type": "Timeline Plausibility | Education Verification",
+      "description": "Candidate claims a Bachelor's degree completed in 2017, but work experience starts in 2015, two years prior to graduation.",
+      "severity": "high"
+    }}
+  ],
+  "gaps_in_experience": [],
+  "final_verdict": "Proceed | Reject",
+  "verdict_reason": "Reject due to critical timeline inconsistency; professional work experience overlaps with full-time education."
+}}
+```
+
+**Candidate Data:**
+
+**Resume (JSON):**
+{{resume_json}}
+
+{{linkedin_section}}
+"""
+
+    STANDARD_VERIFICATION_PROMPT = """You are a world-class resume verification expert. Your task is to conduct a strict analysis of a candidate's resume and LinkedIn profile to identify discrepancies.
+
+**Analysis Dimensions:**
+
+1.  **Resume vs. LinkedIn Discrepancy Analysis:**
+    *   **Experience Verification:** For each job on the resume, find the corresponding entry on LinkedIn. Compare job titles, companies, and employment dates. Note any discrepancies where the resume claims a longer duration or a more senior title.
+    *   **Skills Verification:** Check if the key skills and certifications listed on the resume are supported by the LinkedIn profile.
+    *   **LinkedIn Availability:** If the LinkedIn profile is not provided or is inaccessible, note this as a medium-severity discrepancy.
+
+2.  **Timeline & Gap Analysis:**
+    *   Construct a career timeline based on the resume.
+    *   Identify and report any unexplained employment gaps of 6 months or more.
+
+3.  **Final Verdict Guidance (Strict):**
+    *   **Reject the candidate if the RESUME OVERSTATES experience:**
+        *   The total work experience on the resume is exaggerated by more than **12 months** compared to what is verifiable on LinkedIn.
+        *   A specific job's duration on the resume is inflated by more than **6 months** compared to LinkedIn.
+        *   Key technical skills are listed on the resume but are completely absent from the LinkedIn profile.
+    *   **Do NOT reject if LinkedIn shows MORE experience.** Note it as a 'low' severity discrepancy, but this is not grounds for rejection.
+
+**Output Format:**
+
+Return your analysis as a single JSON object with the specified structure.
+
+```json
+{{
+  "discrepancies": [
+    {{
+      "type": "LinkedIn Comparison",
       "description": "Description of the discrepancy.",
       "severity": "low | medium | high"
     }}
@@ -49,30 +142,24 @@ Return your analysis as a single JSON object. Ensure all date fields are in 'YYY
     {{
       "start_date": "YYYY-MM-DD",
       "end_date": "YYYY-MM-DD",
-      "duration_months": 6,
-      "reason": "Unexplained gap between jobs."
+      "duration_months": 6
     }}
   ],
-  "metrics": {{
-    "resume_quality_score": 0.85,
-    "possible_ai_generated": false,
-    "inconsistencies": [
-      "List of identified inconsistencies."
-    ],
-    "missing_information": [
-      "List of missing information."
-    ]
-  }}
+  "final_verdict": "Proceed | Reject",
+  "verdict_reason": "A brief justification for the verdict based on the guidelines."
 }}
 ```
 
 **Candidate Data:**
 
 **Resume (JSON):**
-{resume_json}
+{{resume_json}}
 
-{linkedin_section}
+{{linkedin_section}}
 """
+
+    VERIFICATION_PROMPT = AI_FABRICATED_RESUME_VERIFICATION_PROMPT
+
 
     def __init__(self):
         super().__init__("VerificationManagerAgent")
@@ -191,52 +278,65 @@ Return your analysis as a single JSON object. Ensure all date fields are in 'YYY
                     gaps.append(cleaned_row)
 
         metrics = verification_data.get('metrics', {})
+        final_verdict = verification_data.get('final_verdict')
+        verdict_reason = verification_data.get('verdict_reason')
 
         # Extract all metrics fields, providing defaults
         resume_quality_score = metrics.get('resume_quality_score')
-        possible_ai_generated = metrics.get('possible_ai_generated')
         inconsistencies = metrics.get('inconsistencies', [])
         missing_info = metrics.get('missing_information', [])
 
-        # Build literal ARRAY<STRUCT> SQL snippets for discrepancies and gaps to avoid complex query parameters
-        def _escape(value: str) -> str:
-            """Escape single quotes for safe SQL literal usage."""
-            return value.replace("'", "\\'") if isinstance(value, str) else value
+        # Use a default value for resume_quality_score if it's None
+        if resume_quality_score is None:
+            resume_quality_score = 0.0  # Or any other suitable default
+            logger.warning("resume_quality_score was None, defaulting to 0.0")
 
-        discrepancies_sql = "[" + ", ".join(
-            f"STRUCT('{_escape(d.get('type', ''))}', '{_escape(d.get('description', ''))}', '{_escape(d.get('severity', ''))}')"
-            for d in discrepancies
-        ) + "]"
+        # Use a default for final_verdict if it's None
+        if final_verdict is None:
+            final_verdict = "needs_review"
+            logger.warning("final_verdict was None, defaulting to 'needs_review'")
 
-        gaps_sql = "[" + ", ".join(
-            f"STRUCT('{gap[0]}'::DATE, '{gap[1]}'::DATE, {gap[2] if gap[2] is not None else 'NULL'}, '{_escape(gap[3])}')"
-            for gap in gaps
-        ) + "]"
+        # Use a default for verdict_reason if it's None
+        if verdict_reason is None:
+            verdict_reason = "AI verdict was not provided."
+            logger.warning("verdict_reason was None, defaulting to 'AI verdict was not provided.'")
 
-        # Construct the MERGE statement with embedded literals
+        # Construct the MERGE statement with query parameters
         script = f"""
         MERGE `{self.resumes_table_id}` T
         USING (SELECT @candidate_id AS candidate_id) S ON T.candidate_id = S.candidate_id
         WHEN MATCHED THEN
             UPDATE SET
-                T.discrepancies = {discrepancies_sql},
-                T.gaps_in_experience = {gaps_sql},
+                T.discrepancies = @discrepancies,
+                T.gaps_in_experience = @gaps_in_experience,
                 T.metrics = STRUCT(
                     @resume_quality_score AS resume_quality_score,
-                    @possible_ai_generated AS possible_ai_generated,
                     @missing_info AS missing_information,
                     @inconsistencies AS inconsistencies
                 ),
+                T.final_verdict = @final_verdict,
+                T.verdict_reason = @verdict_reason,
                 T.updated_at = CURRENT_TIMESTAMP()
         """
 
         # Define scalar and simple array query parameters
         query_params = [
             bigquery.ScalarQueryParameter("candidate_id", "STRING", candidate_id),
+            bigquery.ArrayQueryParameter(
+                "discrepancies",
+                "STRUCT<type STRING, description STRING, severity STRING>",
+                discrepancies
+            ),
+            bigquery.ArrayQueryParameter(
+                "gaps_in_experience",
+                "STRUCT<start_date STRING, end_date STRING, duration_months INT64, reason STRING>",
+                gaps
+            ),
             bigquery.ScalarQueryParameter("resume_quality_score", "FLOAT64", resume_quality_score),
-            bigquery.ScalarQueryParameter("possible_ai_generated", "BOOL", possible_ai_generated),
             bigquery.ArrayQueryParameter("inconsistencies", "STRING", inconsistencies),
-            bigquery.ArrayQueryParameter("missing_info", "STRING", missing_info)
+            bigquery.ArrayQueryParameter("missing_info", "STRING", missing_info),
+            bigquery.ScalarQueryParameter("final_verdict", "STRING", final_verdict),
+            bigquery.ScalarQueryParameter("verdict_reason", "STRING", verdict_reason)
         ]
 
         job_config = bigquery.QueryJobConfig(query_parameters=query_params)
@@ -248,9 +348,11 @@ Return your analysis as a single JSON object. Ensure all date fields are in 'YYY
             logger.error(f"BigQuery BadRequest Error: {e}", exc_info=True)
             logger.error(f"Data sent to BigQuery that caused the error:")
             logger.error(f"  - candidate_id: {candidate_id}")
-            logger.error(f"  - discrepancies: {json.dumps(discrepancies, indent=2)}")
+            logger.error(f"  - discrepancies: {json.dumps(discrepancies, indent=2, default=str)}")
             logger.error(f"  - gaps: {json.dumps(gaps, indent=2, default=str)}")
             logger.error(f"  - metrics: {json.dumps(metrics, indent=2)}")
+            logger.error(f"  - final_verdict: {final_verdict}")
+            logger.error(f"  - verdict_reason: {verdict_reason}")
             raise
         except Exception as e:
             logger.error(f"An unexpected error occurred while updating verification data for {candidate_id}: {e}", exc_info=True)
@@ -281,38 +383,15 @@ Return your analysis as a single JSON object. Ensure all date fields are in 'YYY
             
             resume_data = dict(next(iter(results)))
             
-            # 2. Process email content to get DOB and LinkedIn URL, and update the table
-            updates = {}
-            dob_match = re.search(r'(?:Date of Birth|dob):\s*(\S+)', email_data.body, re.IGNORECASE)
-            if dob_match:
-                updates['date_of_birth'] = dob_match.group(1)
-            
-            linkedin_url_match = re.search(r'LinkedIn:\s*(https?://[\S]+)', email_data.body, re.IGNORECASE)
-            if linkedin_url_match:
-                updates['linkedin_url'] = linkedin_url_match.group(1)
-            
-            if updates:
-                set_clauses = []
-                query_params = [bigquery.ScalarQueryParameter("candidate_id", "STRING", candidate_id)]
-                for field, value in updates.items():
-                    param_name = f"param_{field}"
-                    set_clauses.append(f"T.{field} = @{param_name}")
-                    if field == 'date_of_birth':
-                        query_params.append(bigquery.ScalarQueryParameter(param_name, "DATE", date.fromisoformat(value)))
-                    else:
-                        query_params.append(bigquery.ScalarQueryParameter(param_name, "STRING", value))
-
-                script = f"""
-                MERGE `{self.resumes_table_id}` T
-                USING (SELECT @candidate_id AS candidate_id) S ON T.candidate_id = S.candidate_id
-                WHEN MATCHED THEN
-                    UPDATE SET {', '.join(set_clauses)}, T.updated_at = CURRENT_TIMESTAMP()
-                """
-                job_config = bigquery.QueryJobConfig(query_parameters=query_params)
-                self._update_bigquery_with_retry(script, job_config=job_config)
-                logger.info(f"Updated DOB/LinkedIn for candidate: {candidate_id}")
-                # Refresh resume_data with the latest info
-                resume_data.update(updates)
+            # 2. If email data is present, extract LinkedIn URL
+            linkedin_url_from_email = None
+            if email_data and email_data.body:
+                linkedin_url_match = re.search(r'(https?://(?:www\.)?linkedin\.com/in/[\S]+)', email_data.body, re.IGNORECASE)
+                if linkedin_url_match:
+                    linkedin_url_from_email = linkedin_url_match.group(1)
+                    # Update the resume_data in memory for this run
+                    resume_data['linkedin_url'] = linkedin_url_from_email
+                    logger.info(f"Found LinkedIn URL in email body: {linkedin_url_from_email}")
 
             # 3. Use the potentially updated LinkedIn URL for verification
             linkedin_url_to_use = resume_data.get('linkedin_url')
@@ -341,8 +420,18 @@ Return your analysis as a single JSON object. Ensure all date fields are in 'YYY
             logger.info(f"Received verification JSON from AI: {json.dumps(verification_result, indent=2)}")
 
             if verification_result:
-                self._update_verification_data_in_bq(candidate_id, verification_result)
-                logger.info(f"Successfully stored verification results for candidate {candidate_id}")
+                candidate_name = resume_data.get('name', 'unknown_candidate')
+                sanitized_name = re.sub(r'[^a-zA-Z0-9_]', '', candidate_name.replace(' ', '_')).lower()
+                output_filename = f"{sanitized_name}.json"
+
+                with open(output_filename, 'w') as f:
+                    json.dump(verification_result, f, indent=2)
+                
+                logger.info(f"Verification result for '{candidate_name}' saved to {output_filename}")
+                print("\n--- Verification Result ---")
+                print(json.dumps(verification_result, indent=2))
+                print("--- End Verification Result ---\n")
+
             else:
                 logger.warning("Verification result was empty. Nothing to store.")
 

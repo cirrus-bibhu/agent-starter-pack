@@ -10,20 +10,20 @@ def test_email_processing():
     
     job_posting_email = {
         "id": "email_job_post_001",
-        "subject": "Your job is posted: [MAV-IND-1004 Hyperion Essbase Developer]",
+        "subject": "Your job is posted for the role of Python Developer",
         "body": """
 Dear Hiring Team,
 
 Please review the details for our new job opening.
 This is an urgent hire for our division.
-The full job description can be found here: https://www.linkedin.com/jobs/view/4256698922
+The full job description can be found here: https://www.linkedin.com/jobs/view/4270079854
 
 
 Best regards,
 HR Department
 """,
         "sender": "test.recruiter@krestasoftech.com",
-        "recipient": "bibhu@mavlra.com",
+        "recipient": "bibhu@mavlra.com",    
         "timestamp": "2025-07-03T16:45:00Z",
         "attachments": []
     }

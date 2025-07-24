@@ -12,28 +12,28 @@ from .coordinator import CoordinatorAgent
 def test_resume_email_processing():
     print("--- Testing Resume Application Email Processing ---")
 
-    # The PDF is located one directory above 'app/agents'
-    pdf_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'Gowthami -Java-LinkedInMisMatch.docx'))
+    # The DOCX is located one directory above 'app/agents'
+    pdf_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'Harry_Sun.docx'))
     with open(pdf_path, "rb") as f:
         pdf_bytes = f.read()
 
     resume_email = {
         "id": "email_resume_app_001",
-        "subject": "Resume Application for  Position MAV-2419",
+        "subject": "Resume Application for  Position 4256698922",
         "body": """
 Dear Hiring Team,
 
-Please find attached my resume for your consideration for the Java Developer role.
+Please find attached my resume for your consideration for the Python Developer role.
 
 Best regards,
-Gowthami
+Akshay Bajpai
 """,
-        "sender": "gowthami.apps415@gmail.com",
+        "sender": "akhilramadugu@mywebemails.com",
         "recipient": "bibhu@mavlra.com",
         "timestamp": "2025-07-11T17:12:00Z",
         "attachments": [
             {
-                "filename": "Gowthami -Java-LinkedInMisMatch.docx",
+                "filename": "Harry_Sun.docx",
                 "content_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 "content": pdf_bytes.hex()
             }

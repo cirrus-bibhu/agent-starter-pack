@@ -237,34 +237,50 @@ class ResumeProcessorAgent(BaseAgent):
             return []
 
     def _clean_json_response(self, response: str) -> Dict[str, Any]:
-        """Cleans and parses the LLM's JSON response, inspired by job_poster_agent."""
+        """Cleans and parses the LLM's JSON response with robust error handling."""
         try:
+            # 1. Aggressively find the JSON block
             match = re.search(r'```(?:json)?\n?([\s\S]*?)\n?```', response)
             if match:
                 json_str = match.group(1).strip()
             else:
                 start_idx = response.find('{')
                 end_idx = response.rfind('}') + 1
-                if start_idx == -1 or end_idx == 0:
-                    self.logger.error("No JSON object found in LLM response.")
-                    self.logger.debug(f"Raw response for debugging: {response}")
-                    return {}
-                json_str = response[start_idx:end_idx]
+                if start_idx != -1 and end_idx != 0:
+                    json_str = response[start_idx:end_idx].strip()
+                else:
+                    self.logger.error("Could not extract JSON block from LLM response.")
+                    self.logger.debug(f"Raw response: {response}")
+                    return None
 
-            # Attempt to fix common JSON errors, like unescaped backslashes
-            # This regex finds backslashes that are not followed by a valid escape character and escapes them.
-            json_str = re.sub(r'\\(?!["\\/bfnrt])', r'\\\\', json_str)
+            # 2. Pre-cleaning and syntax correction
+            json_str = re.sub(r'[\x00-\x1f]', '', json_str)
+            json_str = re.sub(r'\}\s*\{', '}, {', json_str)
+            json_str = re.sub(r'(")\s*\n\s*(")', r'\1,\n\2', json_str)
+            json_str = re.sub(r'(\d)\s*\n\s*(")', r'\1,\n\2', json_str)
+            json_str = re.sub(r'(\])\s*\n\s*(")', r'\1,\n\2', json_str)
+            json_str = re.sub(r'(\})\s*\n\s*(")', r'\1,\n\2', json_str)
 
+            # 3. Final parsing attempt
             try:
-                return json.loads(json_str)
+                cleaned_str = self._remove_trailing_commas(json_str)
+                return json.loads(cleaned_str)
             except json.JSONDecodeError as e:
-                self.logger.error(f"JSON parsing failed: {e}")
-                self.logger.debug(f"Problematic JSON string for debugging: {json_str}")
-                return {}
+                self.logger.error(f"JSON parsing failed after all cleaning attempts: {e}")
+                self.logger.debug(f"Problematic JSON string for debugging: {cleaned_str}")
+                return None
 
         except Exception as e:
-            self.logger.error(f"An unexpected error occurred while cleaning JSON response: {e}", exc_info=True)
-            return {}
+            self.logger.error(f"An unexpected error occurred during JSON cleaning: {e}", exc_info=True)
+            return None
+
+    def _remove_trailing_commas(self, json_str: str) -> str:
+        """
+        Remove trailing commas from JSON strings to make them valid.
+        Trailing commas are commas that appear after the last element in an array or object.
+        """
+        pattern = r',(?=\\s*[}\\]])'
+        return re.sub(pattern, '', json_str)
 
     def _upload_to_gcs(self, file_path: str, content: bytes = None) -> str:
         """Uploads content to Google Cloud Storage and returns the URI."""

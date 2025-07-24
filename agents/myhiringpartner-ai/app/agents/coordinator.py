@@ -2,7 +2,7 @@ from datetime import time
 import time
 import logging
 import re
-from typing import Dict, Any, Literal
+from typing import Dict, Any, Literal, Optional
 from google.generativeai import protos
 from pydantic import BaseModel, Field
 import json
@@ -10,7 +10,7 @@ from app.agent import BaseAgent, EmailData, EmailType
 from app.agents.candidate_engager_agent import CandidateEngagerAgent
 from app.agents.job_poster_agent import JobPosterAgent
 from app.agents.resume_poster_agent import ResumeProcessorAgent
-from app.agents.matching_service import MatchingServiceAgent
+from app.agents.matching_service import MatchingService
 from app.agents.recruiter_engager_agent import RecruiterEngagerAgent
 from app.agents.ex_consultant_agent import ExConsultantAgent
 from app.agents.verification_manager import VerificationManagerAgent
@@ -200,7 +200,7 @@ class CoordinatorAgent(BaseAgent):
         self.logger.info("Initializing RecruiterEngagerAgent...")
         self.recruiter_engager_agent = RecruiterEngagerAgent()
         self.candidate_engager_agent = CandidateEngagerAgent()
-        self.matching_service = MatchingServiceAgent()
+        self.matching_service = MatchingService()
         self.ex_consultant_agent = ExConsultantAgent()
         self.verification_manager_agent = VerificationManagerAgent()
         
@@ -386,6 +386,22 @@ class CoordinatorAgent(BaseAgent):
                 "message": str(e)
             }
 
+    def _extract_job_id_from_subject(self, subject: str) -> Optional[str]:
+        """Extract job ID from email subject."""
+        # Look for patterns like "Position 12345" or "JobID: 12345" etc.
+        import re
+        patterns = [
+            r'Position\s+(\d+)',  # Matches "Position 12345"
+            r'Job[\s-]?ID[\s:]+(\d+)',  # Matches "Job ID: 12345" or "Job-ID 12345"
+            r'\b(\d{4,})\b'  # Matches any 4+ digit number
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, subject)
+            if match:
+                return match.group(1)
+        return None
+
     def route_to_resume_processor(self, email_content: str, confidence: float = 0.8) -> Dict[str, Any]:
         try:
             self.logger.info(f"Routing to resume processor agent with confidence: {confidence}")
@@ -400,7 +416,8 @@ class CoordinatorAgent(BaseAgent):
                 analysis = result.get('analysis', {})
                 self.logger.info(f"Successfully processed resume for: {analysis.get('candidate_name', 'N/A')}")
                 
-                return {
+                # Prepare the response
+                response = {
                     "status": "success",
                     "agent": "resume_processor",
                     "confidence": confidence,
@@ -412,6 +429,70 @@ class CoordinatorAgent(BaseAgent):
                         "processing_time": f"{duration:.2f}s"
                     }
                 }
+                
+                # Extract candidate_id and job_id
+                candidate_id = result.get('candidate_id')
+                if not candidate_id and isinstance(result.get('result'), dict):
+                    candidate_id = result['result'].get('candidate_id')
+                
+                job_id = None
+                if hasattr(email_data, 'subject'):
+                    job_id = self._extract_job_id_from_subject(email_data.subject)
+                
+                if candidate_id and job_id:
+                    self.logger.info(f"Calling matching service for candidate_id={candidate_id} and job_id={job_id}")
+                    try:
+                        # First, ensure the job posting exists in the database
+                        try:
+                            job_data = self.matching_service._fetch_jd_data(job_id)
+                            if not job_data:
+                                self.logger.warning(f"Job ID {job_id} not found in the database")
+                                response['matching_result'] = {
+                                    'status': 'warning',
+                                    'message': f'Job ID {job_id} not found in the database',
+                                    'candidate_id': candidate_id,
+                                    'job_id': job_id
+                                }
+                                return response
+                                
+                            # If job exists, find matching candidates
+                            match_result = self.matching_service.workflow1_jd_to_resumes(job_id)
+                            response['matching_result'] = match_result
+                            self.logger.info(f"Matching service completed with status: {match_result.get('status', 'unknown')}")
+                            
+                        except Exception as e:
+                            self.logger.error(f"Error in matching service: {str(e)}", exc_info=True)
+                            response['matching_result'] = {
+                                'status': 'error',
+                                'message': f'Error in matching service: {str(e)}',
+                                'candidate_id': candidate_id,
+                                'job_id': job_id
+                            }
+                            
+                    except Exception as e:
+                        self.logger.error(f"Error calling matching service: {str(e)}", exc_info=True)
+                        response['matching_result'] = {
+                            'status': 'error',
+                            'message': f'Failed to call matching service: {str(e)}',
+                            'candidate_id': candidate_id,
+                            'job_id': job_id
+                        }
+                else:
+                    missing = []
+                    if not candidate_id:
+                        missing.append('candidate_id')
+                    if not job_id:
+                        missing.append('job_id (from email subject)')
+                    warning_msg = f"Cannot run matching service - missing: {', '.join(missing)}"
+                    self.logger.warning(warning_msg)
+                    response['matching_result'] = {
+                        'status': 'warning',
+                        'message': warning_msg,
+                        'candidate_id': candidate_id,
+                        'job_id': job_id
+                    }
+                
+                return response
             else:
                 self.logger.error(f"Resume processing failed: {result.get('message')}")
             
@@ -484,9 +565,32 @@ MyHiringPartner.ai"""
             self.logger.debug(f"Classification completed in {classification_time:.2f}s")
             
             if classification == EmailType.JOB_POSTING:
-                return self.route_to_job_poster(email_json, confidence=0.9)
+                result = self.route_to_job_poster(email_json, confidence=0.9)
+                if result.get("status") == "success" and result.get("details", {}).get("job_id"):
+                    job_id = result["details"]["job_id"]
+                    self.logger.info(f"Job posting successful. Triggering matching service for job_id: {job_id}")
+                    try:
+                        match_results = self.matching_service.workflow1_jd_to_resumes(job_id=job_id)
+                        self.logger.info(f"Matching service completed for job_id: {job_id}. Results: {match_results}")
+                        result['matching_results'] = match_results
+                    except Exception as e:
+                        self.logger.error(f"Matching service failed for job_id {job_id}: {e}", exc_info=True)
+                        result['matching_results'] = {"status": "error", "message": str(e)}
+                return result
+
             elif classification == EmailType.RESUME_APPLICATION:
-                return self.route_to_resume_processor(email_json, confidence=0.9)
+                result = self.route_to_resume_processor(email_json, confidence=0.9)
+                if result.get("status") == "success" and result.get("details", {}).get("candidate_id"):
+                    candidate_id = result["details"]["candidate_id"]
+                    self.logger.info(f"Resume processing successful. Triggering matching service for candidate_id: {candidate_id}")
+                    try:
+                        match_results = self.matching_service.workflow2_resume_to_jds(candidate_id=candidate_id)
+                        self.logger.info(f"Matching service completed for candidate_id: {candidate_id}. Results: {match_results}")
+                        result['matching_results'] = match_results
+                    except Exception as e:
+                        self.logger.error(f"Matching service failed for candidate_id {candidate_id}: {e}", exc_info=True)
+                        result['matching_results'] = {"status": "error", "message": str(e)}
+                return result
             elif classification == EmailType.RECRUITER_JD_INFO_REPLIED:
                 self.logger.info("Routing to recruiter engager agent...")
                 result = self.recruiter_engager_agent.run(email_data)
