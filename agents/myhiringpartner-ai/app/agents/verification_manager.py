@@ -420,14 +420,23 @@ Return your analysis as a single JSON object with the specified structure.
             logger.info(f"Received verification JSON from AI: {json.dumps(verification_result, indent=2)}")
 
             if verification_result:
-                candidate_name = resume_data.get('name', 'unknown_candidate')
-                sanitized_name = re.sub(r'[^a-zA-Z0-9_]', '', candidate_name.replace(' ', '_')).lower()
-                output_filename = f"{sanitized_name}.json"
+                update_success = self._update_verification_data_in_bq(candidate_id, verification_result)
+                if not update_success:
+                    logger.error(f"Failed to update BigQuery with verification data for candidate {candidate_id}")
 
-                with open(output_filename, 'w') as f:
+                sanitized_name = re.sub(r'[^a-zA-Z0-9_]', '', candidate_name.replace(' ', '_')).lower()
+                output_filename = f"{sanitized_name}_verification.json"
+                
+                output_dir = "verification_results"
+                if not os.path.exists(output_dir):
+                    os.makedirs(output_dir)
+                
+                full_output_path = os.path.join(output_dir, output_filename)
+
+                with open(full_output_path, 'w') as f:
                     json.dump(verification_result, f, indent=2)
                 
-                logger.info(f"Verification result for '{candidate_name}' saved to {output_filename}")
+                logger.info(f"Verification result for '{candidate_name}' saved to {full_output_path}")
                 print("\n--- Verification Result ---")
                 print(json.dumps(verification_result, indent=2))
                 print("--- End Verification Result ---\n")

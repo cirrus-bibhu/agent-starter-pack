@@ -5,9 +5,9 @@ import uuid
 from typing import Dict, Any, Optional, Union
 from datetime import datetime
 from google.cloud import bigquery
-from ..agent import BaseAgent, EmailData
-from ..config import config
-from ..tools.bq_schema_manager import ensure_table_exists
+from app.agent import BaseAgent, EmailData
+from app.config import config
+from app.tools.bq_schema_manager import ensure_table_exists
 from app.agents.ex_consultant_agent import ExConsultantAgent
 from app.agents.utils import get_missing_fields
 
@@ -305,6 +305,9 @@ class RecruiterEngagerAgent(BaseAgent):
                         "message": f"Could not retrieve updated job details for job_id: {job_id}",
                         "job_id": job_id
                     }
+
+                # Ensure the full, updated details are passed back
+                result["job_details"] = updated_job_data
 
                 remaining_missing_fields = get_missing_fields(updated_job_data)
 

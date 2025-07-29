@@ -1,7 +1,10 @@
 import logging
-from typing import Dict, Any, Union, List
-from ..agent import BaseAgent, EmailData
+from typing import Dict, Any, List
+from google.cloud import bigquery
 import json
+from datetime import date, datetime
+from app.agent import BaseAgent
+from app.config import config
 
 class ExConsultantAgent(BaseAgent):
     """
@@ -9,63 +12,59 @@ class ExConsultantAgent(BaseAgent):
     """
     def __init__(self):
         super().__init__("ExConsultantAgent", model_name="gemini-1.5-pro")
-        self.logger = logging.getLogger(__name__)
+        self.logger = logging.getLogger(self.__class__.__name__)
+
+        self.bq_client = bigquery.Client()
+
+    def _convert_dates_to_str(self, data: Any) -> Any:
+        """Recursively convert date and datetime objects in a data structure to ISO format strings."""
+        if isinstance(data, dict):
+            return {k: self._convert_dates_to_str(v) for k, v in data.items()}
+        if isinstance(data, list):
+            return [self._convert_dates_to_str(i) for i in data]
+        if isinstance(data, (date, datetime)):
+            return data.isoformat()
+        return data
 
     def find_ex_consultants(self, job_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         self.logger.info(f"Finding ex-consultants for job: {job_data.get('job_title')}")
-        
-        job_end_client = job_data.get('end_client_name', '').lower()
-        job_prime_vendor = job_data.get('prime_vendor_name', '').lower()
-        job_description = job_data.get('job_description', '')
-        required_skills = job_data.get('required_technical_skills', [])
+
+        job_end_client = job_data.get('end_client_name')
+        job_prime_vendor = job_data.get('prime_vendor_name')
+
+        companies_to_match = []
+        if job_end_client:
+            companies_to_match.append(job_end_client)
+        if job_prime_vendor:
+            companies_to_match.append(job_prime_vendor)
+
+        if not companies_to_match:
+            self.logger.warning("No end client or prime vendor name provided in job data.")
+            return []
         
         try:
-            query = {
-                "$or": [
-                    {"past_companies": {"$regex": job_end_client, "$options": "i"}},
-                    {"past_companies": {"$regex": job_prime_vendor, "$options": "i"}}
-                ]
-            }
+
+            query_params = [
+                bigquery.ArrayQueryParameter('companies', 'STRING', list(set(companies_to_match)))
+            ]
+            query = f"""
+                SELECT DISTINCT r.*
+                FROM `{self.bq_client.project}.{config.bq_dataset}.resumes` AS r,
+                UNNEST(r.previous_companies) AS past_company
+                WHERE past_company IN UNNEST(@companies)
+            """
+
+            job_config = bigquery.QueryJobConfig(query_parameters=query_params)
+            query_job = self.bq_client.query(query, job_config=job_config)
+
+            results = query_job.result()
+            found_consultants = [dict(row) for row in results]
+            self.logger.info(f"Found {len(found_consultants)} ex-consultant(s) in the database.")
             
-            company_matched_consultants = []
-            
-            if not company_matched_consultants:
-                self.logger.warning("No consultants found by company relationship")
-                return []
-            
-            if required_skills:
-                company_matched_consultants = [
-                    c for c in company_matched_consultants
-                    if any(skill.lower() in [s.lower() for s in c.get('skills', [])] 
-                          for skill in required_skills)
-                ]
-            
-            job_embedding = self._generate_embeddings(job_description)
-            
-            for consultant in company_matched_consultants:
-                consultant['similarity_score'] = self._calculate_similarity(
-                    job_embedding, 
-                    consultant.get('resume_embedding')
-                )
-            
-            company_matched_consultants.sort(key=lambda x: x.get('similarity_score', 0), reverse=True)
-            
-            found_consultants = []
-            for consultant in company_matched_consultants:
-                consultant_copy = consultant.copy()
-                if job_end_client and any(company.lower() == job_end_client 
-                                       for company in consultant.get('past_companies', [])):
-                    consultant_copy['relationship'] = 'ex_end_client'
-                elif job_prime_vendor and any(company.lower() == job_prime_vendor 
-                                           for company in consultant.get('past_companies', [])):
-                    consultant_copy['relationship'] = 'ex_prime_vendor'
-                found_consultants.append(consultant_copy)
-            
-            self.logger.info(f"Found {len(found_consultants)} potential ex-consultants.")
-            return found_consultants
-            
+            return self._convert_dates_to_str(found_consultants)
+
         except Exception as e:
-            self.logger.error(f"Error finding ex-consultants: {e}", exc_info=True)
+            self.logger.error(f"Error querying BigQuery for ex-consultants: {e}", exc_info=True)
             return []
     
     def _generate_embeddings(self, text: str) -> List[float]:
@@ -88,29 +87,37 @@ class ExConsultantAgent(BaseAgent):
         for consultant in ex_consultants:
             consultant_resume_summary = consultant.get('resume_summary', '')
             
-            prompt = f"""You are an expert at matching job descriptions to candidate resumes. \
-            Given the following job description and candidate resume summary, \
-            rate how well the candidate matches the job on a scale of 0 to 100. \
-            Also, provide a brief reasoning for your score. \
-            
-            Job Title: {job_title}
-            Job Description: {job_description}
-            
-            Candidate Name: {consultant.get('name')}
-            Candidate Resume Summary: {consultant_resume_summary}
-            
-            Your response should be a JSON object with 'score' (integer) and 'reasoning' (string) fields. \
-            Example: {{"score": 85, "reasoning": "Candidate has strong relevant skills."}}
-            """
+            prompt = f"""Analyze the job and candidate summary, then provide a JSON response.
+
+Job: {job_title}
+Description: {job_description}
+
+Candidate: {consultant.get('name')}
+Summary: {consultant_resume_summary}
+
+---
+Respond with a JSON object containing 'score' (0-100) and 'reasoning' (a brief explanation).
+Example: {{"score": 85, "reasoning": "Strong match based on NLP experience."}}
+"""
             
             try:
                 response = self.model.generate_content(prompt)
-                if response.text:
-                    match_info = json.loads(response.text.strip())
-                    consultant_copy = consultant.copy()
-                    consultant_copy['match_score'] = match_info.get('score', 0)
-                    consultant_copy['match_reasoning'] = match_info.get('reasoning', 'No reasoning provided.')
-                    matched_results.append(consultant_copy)
+                try:
+                    cleaned_response = response.text.strip()
+                    if cleaned_response.startswith("```json"):
+                        cleaned_response = cleaned_response[7:]
+                    if cleaned_response.endswith("```"):
+                        cleaned_response = cleaned_response[:-3]
+                    
+                    match_info = json.loads(cleaned_response)
+                except (json.JSONDecodeError, AttributeError) as e:
+                    self.logger.error(f"Error decoding LLM response for consultant {consultant.get('id')}: {e}. Response: '{response.text}'")
+                    match_info = {"score": 0, "reasoning": "Error processing AI response."}
+
+                consultant_copy = consultant.copy()
+                consultant_copy['match_score'] = match_info.get('score', 0)
+                consultant_copy['match_reasoning'] = match_info.get('reasoning', 'No reasoning provided.')
+                matched_results.append(consultant_copy)
             except Exception as e:
                 self.logger.error(f"Error matching consultant {consultant.get('name')}: {e}", exc_info=True)
                 consultant_copy = consultant.copy()

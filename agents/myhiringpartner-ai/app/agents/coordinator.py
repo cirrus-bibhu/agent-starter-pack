@@ -593,8 +593,20 @@ MyHiringPartner.ai"""
                 return result
             elif classification == EmailType.RECRUITER_JD_INFO_REPLIED:
                 self.logger.info("Routing to recruiter engager agent...")
-                result = self.recruiter_engager_agent.run(email_data)
-                return self._format_response("recruiter_jd_info_replied", result, 0.9)
+                recruiter_engager_result = self.recruiter_engager_agent.run(email_data)
+                
+                if recruiter_engager_result.get("status") == "success":
+                    self.logger.info("Recruiter engager agent successful. Triggering ex-consultant agent...")
+                    job_data = recruiter_engager_result.get("job_details", {})
+                    if job_data:
+                        ex_consultant_result = self.ex_consultant_agent.run(job_data=job_data)
+                        return self._format_response("ex_consultant_search_completed", ex_consultant_result, 0.9)
+                    else:
+                        self.logger.warning("No job data returned from recruiter engager agent.")
+                        return self._format_response("recruiter_jd_info_replied", recruiter_engager_result, 0.9)
+                else:
+                    self.logger.error("Recruiter engager agent failed.")
+                    return self._format_response("recruiter_jd_info_replied", recruiter_engager_result, 0.9)
             elif classification == EmailType.CANDIDATE_MOVE_FORWAD_REPLY:
                 self.logger.info("Routing to verification manager agent...")
                 result = self.route_to_verification_manager(email_data)

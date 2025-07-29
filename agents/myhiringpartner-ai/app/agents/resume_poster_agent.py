@@ -275,10 +275,7 @@ class ResumeProcessorAgent(BaseAgent):
             return None
 
     def _remove_trailing_commas(self, json_str: str) -> str:
-        """
-        Remove trailing commas from JSON strings to make them valid.
-        Trailing commas are commas that appear after the last element in an array or object.
-        """
+
         pattern = r',(?=\\s*[}\\]])'
         return re.sub(pattern, '', json_str)
 
