@@ -105,7 +105,8 @@ class ResumeProcessorAgent(BaseAgent):
         self.bq_client = self._get_bigquery_client()
         
         self.storage_client = storage.Client()
-        self.bucket_name = "myhiringpartner-ai_artifacts"
+        project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
+        self.bucket_name = f"{project_id}-myhiringpartner-ai-artifacts"
         self.folder_prefix = "resumes/"
         
         self.logger.info(f"Getting GCS bucket: {self.bucket_name}")
@@ -221,7 +222,7 @@ class ResumeProcessorAgent(BaseAgent):
         try:
             return bigquery.Client()
         except Exception as e:
-            self.logger.error(f"Failed to initialize BigQuery client: {e}", exc_info=True)
+            self.logger.error(f"Failed to initialize BigQuery client: {str(e)}", exc_info=True)
             return None
 
     def _generate_embeddings(self, text: str) -> list:

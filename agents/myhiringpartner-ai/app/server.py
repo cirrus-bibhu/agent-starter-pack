@@ -4,6 +4,9 @@ import json
 from fastapi import FastAPI, BackgroundTasks
 from google.cloud import pubsub_v1
 from app.agents.coordinator import CoordinatorAgent
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = FastAPI()
 coordinator = CoordinatorAgent()
@@ -41,4 +44,4 @@ def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8080)

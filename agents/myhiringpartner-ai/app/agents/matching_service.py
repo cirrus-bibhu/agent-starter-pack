@@ -108,7 +108,7 @@ class MatchingService(BaseAgent):
         self.location = location
 
         # Configuration from central config object
-        self.project_id = 'saas-agent-d'
+        self.project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
         self.dataset_id = 'myhiringpartner_ai'
         self.jd_table_name = 'job_details'
         self.resume_table_name = 'resumes'
@@ -967,7 +967,7 @@ class MatchingService(BaseAgent):
                             f"Error processing match for candidate {candidate_id}: {str(match_error)}")
 
                 except Exception as e:
-                    print(f"Error processing match for job {match.get("job_id")}: {str(e)}")
+                    print(f'Error processing match for job {match.get("job_id")}: {str(e)}')
 
             return {
                 "candidate_id": candidate_id,
