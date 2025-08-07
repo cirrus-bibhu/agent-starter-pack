@@ -557,7 +557,13 @@ MyHiringPartner.ai"""
             self.logger.info("Coordinator agent started")
             start_time = time.time()
             
-            email_data = EmailData.from_json(email_json)
+            if isinstance(email_json, str):
+                email_json = json.loads(email_json)
+
+            if 'receiver' in email_json and 'recipient' not in email_json:
+                email_json['recipient'] = email_json.pop('receiver')
+
+            email_data = EmailData(**email_json)
             self.logger.debug(f"Processing email: {email_data.subject}")
             
             classification = self._classify_email_type(email_data)
@@ -600,6 +606,33 @@ MyHiringPartner.ai"""
                     job_data = recruiter_engager_result.get("job_details", {})
                     if job_data:
                         ex_consultant_result = self.ex_consultant_agent.run(job_data=job_data)
+                        # Persist ex-consultant matches to BigQuerychecl 
+                        matched_consultants = ex_consultant_result.get("matched_consultants", [])
+                        job_id = job_data.get("job_id")
+                        for consultant in matched_consultants:
+                            candidate_id = consultant.get("candidate_id") or consultant.get("id")
+                            if not candidate_id or not job_id:
+                                self.logger.warning(f"Skipping match insert: missing candidate_id or job_id (job_id={job_id}, candidate_id={candidate_id})")
+                                continue
+                            try:
+                                if not self.matching_service._check_for_existing_match(job_id, candidate_id):
+                                    # Prepare a minimal match_details dict for storage
+                                    match_details = {
+                                        "match_scores": {"overall_match_score": consultant.get("match_score", 0)},
+                                        "screening_decision": {"status": "Proceed Ahead", "explanation": consultant.get("match_reasoning", "")},
+                                        "mandatory_requirements": {},
+                                        "rule_flagged": "",
+                                        "missing_required_skills": [],
+                                        "missing_preferred_skills": [],
+                                        "key_strengths": [],
+                                        "gaps_and_concerns": []
+                                    }
+                                    match_id = self.matching_service._store_match_result(job_id, candidate_id, consultant.get("match_score", 0), match_details)
+                                    self.logger.info(f"Inserted ex-consultant match for job_id={job_id}, candidate_id={candidate_id}, match_id={match_id}")
+                                else:
+                                    self.logger.info(f"Match already exists for job_id={job_id}, candidate_id={candidate_id}")
+                            except Exception as e:
+                                self.logger.error(f"Failed to insert ex-consultant match for job_id={job_id}, candidate_id={candidate_id}: {e}")
                         return self._format_response("ex_consultant_search_completed", ex_consultant_result, 0.9)
                     else:
                         self.logger.warning("No job data returned from recruiter engager agent.")

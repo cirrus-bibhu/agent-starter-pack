@@ -15,7 +15,7 @@ def test_ex_consultant_workflow_with_found_candidates():
     """
     Tests the end-to-end workflow, simulating a scenario where ex-consultants ARE found.
     """
-    print("--- Testing Ex-Consultant Workflow (Happy Path) ---")
+    print("--- Testing Ex-Consultant Workflow---")
 
     job_id = "4256698922"
     recruiter_reply_email = {
@@ -46,7 +46,7 @@ def test_ex_consultant_workflow_with_found_candidates():
     assert result['status'] == 'success'
     assert result['agent'] == 'ex_consultant_search_completed'
     assert len(result['result']['matched_consultants']) > 0
-    print("\nSuccessfully simulated finding ex-consultants.")
+    print("\nSuccessfully found ex-consultants.")
 
 if __name__ == "__main__":
     test_ex_consultant_workflow_with_found_candidates()

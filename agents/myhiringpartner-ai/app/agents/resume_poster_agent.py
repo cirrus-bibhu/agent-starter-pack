@@ -30,7 +30,7 @@ RESUME_ANALYSIS_PROMPT = '''You are an expert resume analyzer. Your task is to e
 {{
   "candidate_id": "{candidate_id}",
   "candidate_name": "Full name of the candidate",
-  "candidate_email": "Primary email address",
+  "candidate_email": "Primary email address",~
   "candidate_phone": "Primary phone number",
   "candidate_location": "City, State, Country",
   "linkedin_url": "The candidate's LinkedIn profile URL",

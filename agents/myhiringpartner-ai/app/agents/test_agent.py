@@ -16,14 +16,14 @@ Dear Hiring Team,
 
 Please review the details for our new job opening.
 This is an urgent hire for our division.
-The full job description can be found here: https://www.linkedin.com/jobs/view/4270079854
+The full job description can be found here: https://www.linkedin.com/jobs/view/4269275339
 
 
 Best regards,
 HR Department
 """,
-        "sender": "test.recruiter@krestasoftech.com",
-        "recipient": "bibhu@mavlra.com",    
+        "sender": "brmohapatra404@gmail.com",
+        "recipient": "bibhu@myhiringpartner.ai",    
         "timestamp": "2025-07-03T16:45:00Z",
         "attachments": []
     }
@@ -33,7 +33,6 @@ HR Department
     print("\nProcessing Job Posting Email:")
     job_result = coordinator.run(json.dumps(job_posting_email))
     print("Job Posting Result:")
-    print(json.dumps(job_result, indent=2))
 
     if job_result.get("status") == "success" and job_result.get("result", {}).get("recruiter_email"):
         print("\n--- Generated Recruiter Email ---")

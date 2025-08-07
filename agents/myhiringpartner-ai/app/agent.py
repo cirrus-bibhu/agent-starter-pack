@@ -36,6 +36,13 @@ class EmailData:
     attachments: List[Dict[str, Any]] = None
     metadata: Dict[str, Any] = None
 
+    def __init__(self, **kwargs):
+        import dataclasses
+        names = {f.name for f in dataclasses.fields(self)}
+        for k, v in kwargs.items():
+            if k in names:
+                setattr(self, k, v)
+
     @classmethod
     def from_json(cls, json_str: str) -> 'EmailData':
         """Create an EmailData instance from a JSON string"""

@@ -1,10 +1,11 @@
 # app/server.py
 import asyncio
 import json
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, HTTPException
 from google.cloud import pubsub_v1
 from app.agents.coordinator import CoordinatorAgent
 from dotenv import load_dotenv
+
 
 load_dotenv()
 
@@ -36,6 +37,26 @@ async def process_email_async(email_data: dict):
         print(f"Processing result: {result}")
     except Exception as e:
         print(f"Error processing email: {e}")
+
+# Instantiate the coordinator agent at module level (singleton pattern)
+coordinator_agent = CoordinatorAgent()
+
+from typing import Dict, Any
+from fastapi import HTTPException
+
+@app.post("/api/receive-email")
+def receive_email(email_data: Dict[str, Any], background_tasks: BackgroundTasks):
+    """
+    Endpoint to receive email data and invoke the Coordinator Agent as a background task.
+    """
+    if not email_data:
+        raise HTTPException(status_code=400, detail="No email data received")
+
+    # Add the long-running agent task to the background
+    background_tasks.add_task(coordinator_agent.run, email_json=email_data)
+    
+    # Immediately return a response to the client
+    return {"status": "success", "message": "Email received and is being processed by the agent."}
 
 # Health check endpoint
 @app.get("/health")

@@ -2,15 +2,32 @@ import os
 import re
 import json
 import uuid
+import base64
 from typing import Dict, Any, Union
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from ..agent import BaseAgent, EmailData
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from ..tools.linkedin_scrapper import JobExtractor
 from google.cloud import bigquery
 from ..config import config
 from ..tools.bq_schema_manager import ensure_table_exists
 from firebase_admin import firestore, initialize_app
 from google.cloud.firestore_v1.base_query import FieldFilter
+
+# Gmail and authentication imports
+from google.cloud import secretmanager
+import google.auth
+from google.api_core import exceptions as gcloud_exceptions
+from googleapiclient.discovery import build
+from google.auth.transport.requests import Request
+import google.auth.credentials
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import logging
 
 EXTRACT_JOB_LINK_PROMPT = """Extract the LinkedIn job posting URL from this email. Return only the URL, nothing else.
 The URL should start with 'https://www.linkedin.com/jobs/view/'.
@@ -98,11 +115,130 @@ IMPORTANT GUIDELINES:
 8. Maintain the exact structure and field names as specified in the template.
 '''
 
+# Gmail-related constants
+EMAIL_TOKEN_PREFIX = "email-token"
+REFRESH_TOKEN_PREFIX = "refresh"
+ACCESS_TOKEN_PREFIX = "access"
+
+# Gmail configuration - these should be set in your environment or config
 try:
     initialize_app()
     db = firestore.client()
 except Exception as e:
     raise
+
+# Gmail helper classes and functions
+class SecretManagerError(Exception):
+    """Custom exception for Secret Manager operations."""
+    pass
+
+class GmailError(Exception):
+    """Custom exception for Gmail operations."""
+    pass
+
+def _get_project_id() -> str:
+    """Gets the Google Cloud Project ID from the environment or default auth."""
+    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
+    if not project_id:
+        try:
+            _, project_id = google.auth.default()
+        except google.auth.exceptions.DefaultCredentialsError:
+            raise EnvironmentError("GOOGLE_CLOUD_PROJECT env var not set or gcloud auth not configured.")
+    return project_id
+
+def _sanitize_id_components(*args) -> tuple:
+    """Sanitizes strings to be used in Secret Manager secret IDs."""
+    sanitized = []
+    for component in args:
+        sanitized.append(component.replace('@', '-at-').replace('.', '-dot-'))
+    return tuple(sanitized)
+
+def get_latest_secret_version(client: secretmanager.SecretManagerServiceClient, project_id: str, secret_id: str) -> str:
+    """Retrieve the latest version of a secret from Secret Manager."""
+    try:
+        secret_path = f"projects/{project_id}/secrets/{secret_id}/versions/latest"
+        response = client.access_secret_version(request={"name": secret_path})
+        return response.payload.data.decode("UTF-8")
+    except gcloud_exceptions.NotFound:
+        raise SecretManagerError(f"Secret '{secret_id}' not found in Secret Manager")
+    except Exception as e:
+        raise SecretManagerError(f"Error retrieving secret '{secret_id}': {str(e)}")
+
+def retrieve_oauth_tokens_from_secret_manager(email: str) -> tuple:
+    """Retrieve OAuth tokens from Google Cloud Secret Manager."""
+    try:
+        secret_client = secretmanager.SecretManagerServiceClient()
+        project_id = _get_project_id()
+        safe_email = _sanitize_id_components(email)[0]
+        
+        # Retrieve refresh token
+        refresh_token_secret_id = f"{EMAIL_TOKEN_PREFIX}_{REFRESH_TOKEN_PREFIX}_{safe_email}"
+        refresh_token = get_latest_secret_version(secret_client, project_id, refresh_token_secret_id)
+        
+        # Retrieve access token data
+        access_token_secret_id = f"{EMAIL_TOKEN_PREFIX}_{ACCESS_TOKEN_PREFIX}_{safe_email}"
+        access_token_json = get_latest_secret_version(secret_client, project_id, access_token_secret_id)
+        access_token_data = json.loads(access_token_json)
+        
+        return refresh_token, access_token_data
+        
+    except Exception as e:
+        raise SecretManagerError(f"Failed to retrieve OAuth tokens: {str(e)}")
+
+class SecretManagerCredentials(google.auth.credentials.Credentials):
+    """Custom credentials class that uses tokens from Secret Manager."""
+    
+    def __init__(self, refresh_token: str, access_token_data: dict, client_id: str, client_secret: str):
+        super().__init__()
+        self.refresh_token = refresh_token
+        self.token = access_token_data['access_token']
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.token_uri = "https://oauth2.googleapis.com/token"
+        
+        # Parse expiry from stored data
+        if access_token_data.get('expires_at'):
+            expiry_str = access_token_data['expires_at']
+            try:
+                if expiry_str.endswith('Z'):
+                    expiry_str = expiry_str.replace('Z', '+00:00')
+                
+                self.expiry = datetime.fromisoformat(expiry_str)
+                
+                if self.expiry.tzinfo is None:
+                    self.expiry = self.expiry.replace(tzinfo=timezone.utc)
+            except ValueError:
+                self.expiry = None
+        else:
+            self.expiry = None
+            
+        self.scopes = access_token_data.get('scope', [])
+    
+    def refresh(self, request):
+        """Refresh the access token using the refresh token."""
+        import requests
+        
+        data = {
+            'grant_type': 'refresh_token',
+            'refresh_token': self.refresh_token,
+            'client_id': self.client_id,
+            'client_secret': self.client_secret,
+        }
+        
+        response = requests.post(self.token_uri, data=data)
+        response.raise_for_status()
+        
+        token_data = response.json()
+        self.token = token_data['access_token']
+        
+        if 'expires_in' in token_data:
+            self.expiry = datetime.now(timezone.utc) + timedelta(seconds=token_data['expires_in'])
+    
+    @property
+    def expired(self):
+        if not self.expiry:
+            return False
+        return datetime.now(timezone.utc) >= self.expiry
 
 class JobPosterAgent(BaseAgent):
     def __init__(self):
@@ -111,6 +247,12 @@ class JobPosterAgent(BaseAgent):
         api_key = os.getenv("SCRAPIN_API_KEY")
         if not api_key:
             raise ValueError("SCRAPIN_API_KEY is not set.")
+
+        self.gmail_client_id = os.getenv("GMAIL_CLIENT_ID")
+        self.gmail_client_secret = os.getenv("GMAIL_CLIENT_SECRET")
+
+        if not self.gmail_client_id or not self.gmail_client_secret:
+            raise ValueError("GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET must be set in the environment.")
         self.job_extractor = JobExtractor(api_key=api_key)
 
         self.table_id = None
@@ -148,6 +290,63 @@ class JobPosterAgent(BaseAgent):
         except Exception as e:
             self.logger.error(f"Failed to create BigQuery client: {e}")
             return None
+
+    def _create_gmail_service(self, email: str):
+        """Create Gmail service using credentials from Secret Manager."""
+        self.logger.info("Creating Gmail service...")
+        try:
+            refresh_token, access_token_data = retrieve_oauth_tokens_from_secret_manager(email)
+            
+            credentials = SecretManagerCredentials(
+                refresh_token=refresh_token,
+                access_token_data=access_token_data,
+                client_id=self.gmail_client_id,
+                client_secret=self.gmail_client_secret
+            )
+            # Refresh token if expired
+            if credentials.expired:
+                self.logger.info("Access token expired, refreshing...")
+                credentials.refresh(Request())
+            
+            # Build Gmail service
+            service = build('gmail', 'v1', credentials=credentials)
+            self.logger.info("Gmail service created successfully")
+            return service
+            
+        except Exception as e:
+            self.logger.error(f"Error creating Gmail service: {str(e)}")
+            raise GmailError(f"Failed to create Gmail service: {str(e)}")
+
+    def _save_email_as_draft(self, from_email: str, to_email: str, subject: str, body_html: str) -> str:
+        """Save an email as draft in Gmail."""
+        try:
+            # Create Gmail service
+            service = self._create_gmail_service(from_email)
+            
+            # Create the email message
+            message = MIMEMultipart()
+            message['To'] = to_email
+            message['Subject'] = subject
+            message.attach(MIMEText(body_html, 'html'))
+            
+            # Encode the message
+            raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
+            
+            # Create draft
+            draft_body = {
+                'message': {
+                    'raw': raw_message
+                }
+            }
+            
+            draft = service.users().drafts().create(userId='me', body=draft_body).execute()
+            self.logger.info(f"Draft created successfully with ID: {draft['id']}")
+            
+            return draft['id']
+            
+        except Exception as e:
+            self.logger.error(f"Error creating email draft: {str(e)}")
+            raise GmailError(f"Failed to create email draft: {str(e)}")
 
     def extract_job_link(self, email_data: EmailData) -> str:
         if email_data.metadata and "linkedin_links" in email_data.metadata:
@@ -675,7 +874,12 @@ Additional Information:
 
     def run(self, email_input: Union[str, EmailData], **kwargs) -> Dict[str, Any]:
         try:
-            email_data = EmailData.from_json(email_input) if isinstance(email_input, str) else email_input
+            if isinstance(email_input, str):
+                email_data = EmailData.from_json(email_input)
+            elif isinstance(email_input, dict):
+                email_data = EmailData(**email_input)
+            else:
+                email_data = email_input
 
             job_analysis, job_url = self._get_job_details(email_data)
             if not job_url:
@@ -704,14 +908,39 @@ Additional Information:
             if not saved_job_id:
                 return {'status': 'error', 'message': 'Failed to save job details to BigQuery'}
 
-            recruiter_email = self._generate_recruiter_email(prepared_data)
-            
-            return {
-                'status': 'success',
-                'message': 'Job details processed and saved successfully',
-                'job_analysis': prepared_data,
-                'recruiter_email': recruiter_email
-            }
+            missing_info = self._check_essential_information(prepared_data)
+            if not any(missing_info.values()):
+                return {
+                    'status': 'success',
+                    'message': 'Job details processed and saved successfully. No follow-up needed.',
+                    'job_analysis': prepared_data
+                }
+
+            try:
+                email_generation_result = self._generate_recruiter_email(prepared_data, missing_info)
+                if not email_generation_result or not isinstance(email_generation_result, tuple):
+                    raise GmailError("Failed to generate email content.")
+
+                subject, body_html, _ = email_generation_result # Original to_email is ignored
+
+                # The 'from_email' is the agent's address, the 'to_email' is the original sender.
+                from_email = "bibhu@myhiringpartner.ai"
+                to_email = email_data.sender
+
+                if not to_email:
+                    raise GmailError("Original sender's email is not available, cannot send follow-up.")
+                draft_id = self._save_email_as_draft(from_email, to_email, subject, body_html)
+                self.logger.info(f"Successfully saved draft with ID: {draft_id}")
+
+                return {
+                    'status': 'success',
+                    'message': f'Job details saved. Follow-up email drafted with ID: {draft_id}',
+                    'job_analysis': prepared_data,
+                    'draft_id': draft_id
+                }
+            except (GmailError, SecretManagerError) as e:
+                self.logger.error(f"Failed to create or save draft: {e}", exc_info=True)
+                return {'status': 'error', 'message': f'Failed to handle draft: {e}'}
 
         except Exception as e:
             self.logger.error(f"Error processing job posting: {e}", exc_info=True)
@@ -752,12 +981,11 @@ Additional Information:
 
         return missing_info
 
-    def _generate_recruiter_email(self, job_details: Dict[str, Any]) -> str:
+    def _generate_recruiter_email(self, job_details: Dict[str, Any], missing_info: Dict[str, list]) -> tuple:
         """Generate a targeted email to request specific missing information from the recruiter."""
         try:
-            missing_info = self._check_essential_information(job_details)
             if not any(missing_info.values()):
-                return "No essential information is missing."
+                return None
 
             job_title = job_details.get('job_title', 'Unknown Position')
             job_id = job_details.get('job_id', 'N/A')
@@ -789,9 +1017,12 @@ Additional Information:
             subject = f"Follow-up for Job Posting: {job_title}"
             
             # Mimic an email format with headers and body
-            full_email_content = f"Subject: {subject}\nContent-Type: text/html\n\n{email_body}"
-            
-            return full_email_content
+            to_email = job_details.get('recruiter_email')
+            if not to_email:
+                self.logger.error("Recruiter email not found, cannot generate email.")
+                return None
+
+            return subject, email_body, to_email
 
         except Exception as e:
             self.logger.error(f"Error generating recruiter email: {e}", exc_info=True)

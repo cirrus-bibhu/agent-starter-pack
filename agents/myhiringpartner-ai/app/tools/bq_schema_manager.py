@@ -85,6 +85,7 @@ MATCHES_SCHEMA = [
     ]),
     bigquery.SchemaField("interview_recommendation", "BOOLEAN", mode="NULLABLE"),
     bigquery.SchemaField("suggested_interview_questions", "STRING", mode="REPEATED"),
+    bigquery.SchemaField("rule_flagged", "STRING", mode="NULLABLE"),
     bigquery.SchemaField("match_status", "STRING", mode="NULLABLE"),
     bigquery.SchemaField("created_at", "TIMESTAMP", mode="NULLABLE"),
     bigquery.SchemaField("updated_at", "TIMESTAMP", mode="NULLABLE"),

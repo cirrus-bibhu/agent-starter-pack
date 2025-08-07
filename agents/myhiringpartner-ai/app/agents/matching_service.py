@@ -2,6 +2,7 @@ from datetime import datetime, date
 import json
 import os
 import uuid
+from string import Template
 
 from google.cloud import bigquery
 from google.cloud.exceptions import NotFound
@@ -15,85 +16,128 @@ from langchain_google_vertexai import VertexAI
 from vertexai.language_models import TextEmbeddingModel
 
 # Prompt templates
-MATCH_CANDIDATE_PROMPT_TEMPLATE = """You are an expert AI recruiter. Your task is to evaluate a candidate's resume against a job description and provide a detailed, structured JSON output that conforms to the provided BigQuery schema.
+MATCH_PROMPT =  Template("""
+You are an elite AI-recruitment analyst whose prime directive is to protect the hiring-team's time while achieving ≥ 95 % decision accuracy.
 
-**Job Details (JSON):**
-{job_details_json}
+TODAY = "2025-07-22"
 
-**Candidate Resume (JSON):**
-{resume_json}
+══════════  INPUT OBJECTS  ══════════
+• JD_JSON      - structured job description                     $jd_json
+• RESUME_JSON  - structured résumé data                          $resume_json
+• TODAY        - reference date for “Present” end-dates
 
-**Instructions:**
-1.  Carefully analyze the resume and job description.
-2.  Generate a JSON object that strictly follows the structure below.
-3.  Provide scores from 0 to 100.
-4.  For boolean fields, use `true` or `false`.
-5.  For repeated string fields, provide a JSON array of strings.
-6.  Do NOT include any text or formatting outside of the main JSON object.
+═══════════  CONFIG PARAMS  ═════════
+NEAR_THRESHOLD_YRS         = 1.0      # gap ≤ 1 yr → Clarify
+STALE_YRS_PRIMARY          = 3        # primary skill unused > 3 yrs → Stale
+STALE_YRS_NICHE            = 4        # niche skill unused > 4 yrs → Clarify
+MANDATORY_COVERAGE_GOAL    = 0.95     # < 85 % → hard review
+FUZZY_TITLE_MIN_SIM        = 0.78     # Jaccard similarity to avoid false “Core-Mismatch”
+ALLOWED_FOR_CLARIFICATION  = {
+  "Git", "GitLab", "CI/CD", "Jenkins", "Docker", "Unit Testing",
+  "Terraform", "SciPy", "NumPy", "SQL",
+  "React Testing Library", "SyncFusion", "Omniscript",
+  "Patch Management", "LinkedIn Outreach", "Visualforce"
+}
 
-**Output JSON Format:**
-```json
-{{
-    "mandatory_requirements": {{
-        "skills_requirement_met": <true/false>,
-        "experience_requirement_met": <true/false>,
-        "domain_requirement_met": <true/false>,
-        "education_requirement_met": <true/false>,
-        "location_requirement_met": <true/false>
-    }},
-    "match_scores": {{
-        "overall_match_score": <float>,
-        "skill_match_score": <float>,
-        "experience_match_score": <float>,
-        "domain_match_score": <float>,
-        "education_match_score": <float>,
-        "location_match_score": <float>
-    }},
-    "missing_required_skills": [<array of strings>],
-    "missing_preferred_skills": [<array of strings>],
-    "key_strengths": [<array of strings>],
-    "gaps_and_concerns": [<array of strings>],
-    "screening_decision": {{
-        "status": <"Proceed Ahead", "Reject", or "Clarification Needed">,
-        "explanation": <string>,
-        "clarification_questions": [<array of strings>]
-    }},
-    "interview_recommendation": <true/false>,
-    "suggested_interview_questions": [<array of strings>]
-}}
-```
+════════  STAGE-1  (JD & CV DECODE)  ════════
+1 **JD parsing**
+    jd_core_function      - distilled role label
+    jd_primary_skill      - single, load-bearing tech / domain
+    mandatory_items_raw   - all *explicit* “must” items
+    ▸ Partition mandatory_items_raw
+        Tier-1 = jd_primary_skill + any item literally tagged “MANDATORY” /
+                 or containing phrases {“must have”, “required”}
+        Tier-2 = remaining mandatory items
+
+2 **Résumé analysis**
+    core_profile          - synthesise from most-recent titles + summary
+    evidence_map          - {mandatory_item : evidence-string | null}
+    last_used_years       - {skill : YEARS since last end-date}
+    total_exp_years       - de-overlapped years, rounded 0.5
+    empty_resume          = len(resume_json["experience"]) == 0
+
+3 **Niche flag**
+    is_niche_role = jd_core_function or jd_primary_skill in
+                    {"Guidewire","COBOL","Murex","Vlocity","Hybris",
+                     "TM1","Hyperion Essbase","Zuora","ABAP (only)",
+                     "Medical-Device (IEC 62304)"}
+
+════════  STAGE-2  (DECISION FUNNEL)  ════════
+Apply rules in order; first hit wins.
+
+**Rule 0  - Location Mismatch  → Rejected**
+     if (JD does NOT allow remote AND does NOT allow relocation)
+         AND (candidate city NOT in JD allowed cities)
+         → Rejected
+     else if (candidate country NOT in JD allowed countries)
+         → Rejected
+
+ **Rule 1  - Core Mismatch  → Rejected**
+       if   JaccardSim(core_profile, jd_core_function) < FUZZY_TITLE_MIN_SIM
+        OR  empty_resume == true.
+
+ **Rule 2  - Over-qualified  → Rejected**
+       if JD defines a *maximum* years / level AND total_exp_years > max.
+
+ **Rule 3  - Niche Clarification  → Clarify**
+       if is_niche_role
+          AND jd_primary_skill in evidence_map
+          AND ( missing_any_other_mandatory
+                OR last_used_years[jd_primary_skill] > STALE_YRS_NICHE )
+
+ **Rule 4  - Critical Gap  → Rejected**
+       if (missing ≥ 1 Tier-1 item)
+          OR (missing ≥ 3 Tier-2 items not in ALLOWED_FOR_CLARIFICATION).
+
+ **Rule 5  - Near-Threshold  → Clarify**
+       if ( exactly 1 Tier-2 item missing
+            OR gap_in_required_years ≤ NEAR_THRESHOLD_YRS
+            OR missing_item ∈ ALLOWED_FOR_CLARIFICATION ).
+
+ **Rule 6  - Stale Experience  → Rejected**
+       if last_used_years[jd_primary_skill] > STALE_YRS_PRIMARY
+          AND is_niche_role == false.
+
+ **Rule 7  - Plausible Omission  → Clarify**
+       if strong domain alignment (≥ 85 % Tier-2 present)
+          BUT 1 technical Tier-1/Tier-2 item absent.
+
+ **Rule 8  - Strong Match  → Moving Forward**
+       if   no Tier-1 gaps
+        AND len(missing_items) == 0
+        AND mandatory_coverage_ratio ≥ MANDATORY_COVERAGE_GOAL.
+
+── **Post-Decision Sanity Check** ──  
+IF outcome == "Rejected" AND (
+        mandatory_coverage_ratio ≥ MANDATORY_COVERAGE_GOAL
+     OR len(missing_items) ≤ 2 )
+   THEN   outcome = "Requires Clarification"
+          rule_flagged = "Post-Check Adjustment"
+
+════════  STAGE-3  (JSON RESPONSE)  ════════
+Return **only**:
+
+{
+  "outcome": "Moving Forward | Rejected | Requires Clarification",
+  "reason": "<concise text or empty>",
+  "rule_flagged": "Rule # - Name | Post-Check Adjustment",
+  "is_niche_role": true|false,
+  "core_function": "<JD label>",
+  "core_profile": "<Résumé label>",
+  "missing_items": [ … ],
+  "stale_skills":  [ … ],
+  "recency_summary": { "skill": "X years ago", … }
+}
+
+Notes  
+• JaccardSim(a,b) = |tokensₐ∩tokens_b| ÷ |tokensₐutokens_b| after lower-casing & stop-word drop.  
+• mandatory_coverage_ratio = (# mandatory_items with evidence) ÷ (total mandatory_items_raw).  
+• ALWAYS prefer “Clarification” over “Rejection” when in doubt and coverage ≥ 85 %.
+
+Respond **only** with the JSON - no extra prose, markdown, or line-break errors.
 """
+)
 
-MATCH_EX_EMPLOYEE_PROMPT_TEMPLATE = """You are an expert AI recruiter evaluating a former employee. Focus ONLY on the skills match.
-
-**Job Details (JSON):**
-{job_details_json}
-
-**Candidate Resume (JSON):**
-{resume_json}
-
-**Instructions:**
-1.  Focus exclusively on the technical skills match.
-2.  If the skills match well (score > 60), recommend proceeding.
-3.  Generate a JSON object with only the specified fields.
-
-**Output JSON Format:**
-```json
-{{
-    "match_scores": {{
-        "overall_match_score": <float based on skills>,
-        "skill_match_score": <float>
-    }},
-    "missing_required_skills": [<array of strings>],
-    "key_strengths": [<array of strings>],
-    "gaps_and_concerns": [<array of strings>],
-    "screening_decision": {{
-        "status": <"Proceed Ahead" or "Clarification Needed">,
-        "explanation": <string>
-    }}
-}}
-```
-"""
 
 def default_json_serializer(obj):
     """JSON serializer for objects not serializable by default json code"""
@@ -114,7 +158,6 @@ class MatchingService(BaseAgent):
         self.resume_table_name = 'resumes'
         self.match_table_name = 'matches'
 
-        # Removed the three table attributes to construct table IDs on demand
 
         self.credentials, _ = google.auth.default()
         self._initialize_model()
@@ -244,6 +287,7 @@ class MatchingService(BaseAgent):
                             "suggested_interview_questions", "STRING", mode="REPEATED")
                     ]),
                     bigquery.SchemaField("match_status", "STRING"),
+                    bigquery.SchemaField("rule_flagged", "STRING", mode="NULLABLE"),
                     bigquery.SchemaField("created_at", "TIMESTAMP"),
                     bigquery.SchemaField("updated_at", "TIMESTAMP")
                 ]
@@ -441,41 +485,20 @@ class MatchingService(BaseAgent):
             print(f"Error in vector search query: {str(e)}")
             return []
 
-    def _load_ex_employee_prompt_template(self):
-        return MATCH_EX_EMPLOYEE_PROMPT_TEMPLATE
-
-    def _load_match_prompt_template(self):
-        return MATCH_CANDIDATE_PROMPT_TEMPLATE
-
     def _detailed_llm_match(self, jd_data, resume_data):
         try:
-            # Determine if the candidate is an ex-employee
-            jd_company = str(jd_data.get("company_name", "")).lower()
-            resume_previous_companies = [str(c).lower() for c in resume_data.get("previous_companies", []) if c]
-            is_ex_employee = any(jd_company in prev_comp for prev_comp in resume_previous_companies if jd_company)
+            prompt = PromptTemplate.from_template(MATCH_PROMPT)
 
-            # Select the appropriate prompt template
-            prompt_template = (
-                MATCH_EX_EMPLOYEE_PROMPT_TEMPLATE
-                if is_ex_employee
-                else MATCH_CANDIDATE_PROMPT_TEMPLATE
-            )
-            prompt = PromptTemplate.from_template(prompt_template)
-
-            # Create the chain
             chain = prompt | self.llm | StrOutputParser()
 
-            # Convert data to JSON strings for the prompt, handling datetimes
             jd_json = json.dumps(jd_data, indent=2, default=default_json_serializer)
             resume_json = json.dumps(resume_data, indent=2, default=default_json_serializer)
 
-            # Invoke the chain
             response = chain.invoke({
-                "job_details_json": jd_json,
+                "jd_json": jd_json,
                 "resume_json": resume_json,
             })
 
-            # Clean and parse the JSON response
             if response.strip().startswith("```json"):
                 response = response.strip()[7:-4]
 
@@ -498,6 +521,12 @@ class MatchingService(BaseAgent):
                 "updated_at": created_at,
                 "match_status": "Pending Review",
             }
+
+            # Extract rule_flagged from match_details (from LLM response)
+            rule_flagged = match_details.get("rule_flagged", "")
+            if rule_flagged is None:
+                rule_flagged = ""
+            row_to_insert["rule_flagged"] = rule_flagged
 
             row_to_insert.update(match_details)
 

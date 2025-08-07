@@ -34,7 +34,7 @@ Thanks,
 Recruiter
 """,
         "sender": "test.recruiter@krestasoftech.com",
-        "recipient": "bibhu@mavlra.com",
+        "recipient": "bibhu@myhiringpartner.ai",
         "timestamp": "2025-07-04T10:00:00Z",
         "attachments": []
     }

@@ -29,7 +29,7 @@ Best regards,
 Akshay Bajpai
 """,
         "sender": "akhilramadugu@mywebemails.com",
-        "recipient": "bibhu@mavlra.com",
+        "recipient": "bibhu@myhiringpartner.ai",
         "timestamp": "2025-07-11T17:12:00Z",
         "attachments": [
             {
