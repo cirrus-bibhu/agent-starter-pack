@@ -14,6 +14,7 @@ from app.agents.matching_service import MatchingService
 from app.agents.recruiter_engager_agent import RecruiterEngagerAgent
 from app.agents.ex_consultant_agent import ExConsultantAgent
 from app.agents.verification_manager import VerificationManagerAgent
+from app.agents.job_closing_agent import JobClosingAgent
 
 ROUTING_PROMPT_TEMPLATE = """Analyze the following email and call the appropriate function to process it.
 
@@ -23,9 +24,10 @@ From: {sender}
 Body: {body}
 Attachments: {attachments}
 
-You have two possible actions:
+You have three possible actions:
 1. Call route_to_job_poster(email_content, confidence) - For job postings, hiring announcements, or position descriptions
 2. Call route_to_resume_processor(email_content, confidence) - For resumes, job applications, or candidate submissions
+3. Call route_to_job_closing(email_content, confidence) - For emails indicating a job is filled or closed
 
 Key indicators for job postings:
 - Job IDs or reference numbers in subject
@@ -66,7 +68,9 @@ CATEGORIES:
 
 4. "candidate_move_forwad_reply" - Emails from candidates providing additional information like education, date of birth, and LinkedIn profile for verification purposes.
 
-4. "unknown" - Use only if the email clearly doesn't fit the above categories
+5. "job_closing" - Emails indicating that a job position has been filled, closed, or is no longer available.
+
+6. "unknown" - Use only if the email clearly doesn't fit the above categories
 
 ANALYSIS INSTRUCTIONS:
 - Carefully examine both subject line and email body
@@ -82,7 +86,7 @@ Sender: {{sender}}
 Attachments: {{num_attachments}} files
 
 Your response must be a JSON object matching the EmailClassification schema with:
-1. category: Exactly one of ["job_posting", "resume_application", "recruiter_jd_info_replied", "candidate_move_forwad_reply", "unknown"]
+1. category: Exactly one of ["job_posting", "resume_application", "recruiter_jd_info_replied", "candidate_move_forwad_reply", "job_closing", "unknown"]
 2. confidence: A float between 0-1 indicating classification confidence
 3. reasoning: A clear explanation of why this classification was chosen
 
@@ -129,7 +133,7 @@ MyHiringPartner.ai'''
 
 
 class EmailClassification(BaseModel):
-    category: Literal["job_posting", "resume_application", "recruiter_jd_info_replied", "candidate_move_forwad_reply", "unknown"] = Field(
+    category: Literal["job_posting", "resume_application", "recruiter_jd_info_replied", "candidate_move_forwad_reply", "job_closing", "unknown"] = Field(
         description="The classified category of the email"
     )
     confidence: float = Field(
@@ -184,7 +188,25 @@ class CoordinatorAgent(BaseAgent):
                                     description="Confidence level that this is a resume application (0-1)"
                                 )
                             },
-                            required=["email_content"]
+                            required=["email_content", "confidence"]
+                        )
+                    ),
+                    protos.FunctionDeclaration(
+                        name="route_to_job_closing",
+                        description="Route email to job closing agent for processing job closing notifications",
+                        parameters=protos.Schema(
+                            type=protos.Type.OBJECT,
+                            properties={
+                                "email_content": protos.Schema(
+                                    type=protos.Type.STRING,
+                                    description="The email content to be processed"
+                                ),
+                                "confidence": protos.Schema(
+                                    type=protos.Type.NUMBER,
+                                    description="Confidence level that this is a job closing notification (0-1)"
+                                )
+                            },
+                            required=["email_content", "confidence"]
                         )
                     )
                 ]
@@ -203,6 +225,7 @@ class CoordinatorAgent(BaseAgent):
         self.matching_service = MatchingService()
         self.ex_consultant_agent = ExConsultantAgent()
         self.verification_manager_agent = VerificationManagerAgent()
+        self.job_closing_agent = JobClosingAgent()
         
         self.logger = logging.getLogger("CoordinatorAgent")
         self.logger.setLevel(logging.DEBUG)
@@ -401,6 +424,21 @@ class CoordinatorAgent(BaseAgent):
             if match:
                 return match.group(1)
         return None
+
+    def route_to_job_closing(self, email_content: str, confidence: float = 0.8):
+        """Routes job closing emails to the job closing agent."""
+        self.logger.info(f"Routing to JobClosingAgent with confidence: {confidence}")
+        try:
+            email_data = json.loads(email_content)
+            job_id = self._extract_job_id_from_subject(email_data.get("subject", ""))
+            if not job_id:
+                return self._format_response("job_closing_agent", {"status": "error", "message": "Could not extract job_id from subject."}, confidence)
+
+            result = self.job_closing_agent.run(job_id=job_id)
+            return self._format_response("job_closing_agent", result, confidence)
+        except Exception as e:
+            self.logger.error(f"Error in route_to_job_closing: {e}", exc_info=True)
+            return self._format_response("job_closing_agent", {"status": "error", "message": str(e)}, confidence)
 
     def route_to_resume_processor(self, email_content: str, confidence: float = 0.8) -> Dict[str, Any]:
         try:
@@ -647,6 +685,14 @@ MyHiringPartner.ai"""
                     return self._format_response("candidate_move_forwad_reply", result, 0.9)
                 else:
                     return result
+            elif classification == EmailType.JOB_CLOSING:
+                self.logger.info("Routing to job closing agent...")
+                job_id = self._extract_job_id_from_subject(email_data.subject)
+                if not job_id:
+                    return {"status": "error", "message": "Could not extract job_id from subject for job closing."}
+                
+                result = self.job_closing_agent.run(job_id=job_id)
+                return self._format_response("job_closing", result, 0.9)
             else:
                 self.logger.warning(f"Could not classify email: {email_data.subject}")
                 return {

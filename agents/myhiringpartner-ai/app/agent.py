@@ -79,6 +79,7 @@ class EmailType(Enum):
     RESUME_APPLICATION = "resume_application"
     RECRUITER_JD_INFO_REPLIED = "recruiter_jd_info_replied"
     CANDIDATE_MOVE_FORWAD_REPLY = "candidate_move_forwad_reply"
+    JOB_CLOSING = "job_closing"
     UNKNOWN = "unknown"
 
 class BaseAgent(ABC):
