@@ -1,3 +1,4 @@
+import os
 import requests
 import re
 import json
@@ -20,9 +21,14 @@ class JobExtractor:
             if 'url' in params:
                 url = unquote(params['url'][0]).replace('%2E', '.')
         
-        job_id = re.search(r'(\d{10})', url)
-        if job_id:
-            return f"https://www.linkedin.com/jobs/view/{job_id.group(1)}"
+        m = re.search(r"/(?:comm/)?jobs/view/(?:[\w\-]*-)?(\d+)(?:[/?#]|$)", url)
+        if m:
+            return f"https://www.linkedin.com/jobs/view/{m.group(1)}"
+
+        # Fallback: pick the last 7-12 digit sequence in the URL
+        ids = re.findall(r"(\d{7,12})", url)
+        if ids:
+            return f"https://www.linkedin.com/jobs/view/{ids[-1]}"
         return url
     
     def extract(self, job_url):

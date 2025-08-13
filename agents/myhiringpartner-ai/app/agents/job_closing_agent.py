@@ -1,4 +1,5 @@
 import logging
+import os
 from google.cloud import bigquery
 from ..config import config
 
@@ -7,7 +8,11 @@ class JobClosingAgent:
         self.logger = logging.getLogger("JobClosingAgent")
         self.logger.setLevel(logging.DEBUG)
         self.bq_client = bigquery.Client()
-        self.table_id = f"{config.GCP_PROJECT_ID}.{config.BIGQUERY_DATASET_ID}.{config.BIGQUERY_JOB_DETAILS_TABLE_ID}"
+        # Resolve project and dataset from environment if provided, otherwise fall back
+        project = os.getenv("GOOGLE_CLOUD_PROJECT") or self.bq_client.project
+        dataset = os.getenv("BQ_DATASET") or config.bq_dataset
+        table = config.bq_table  # defaults to "job_details"
+        self.table_id = f"{project}.{dataset}.{table}"
 
     def run(self, job_id: str):
         self.logger.info(f"Attempting to close job_id: {job_id}")

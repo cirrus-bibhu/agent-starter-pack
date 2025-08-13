@@ -10,8 +10,8 @@ import google.generativeai as genai
 
 genai.configure(api_key=os.getenv('GEMINI_API_KEY', ''))
 
-EXTRACT_LINKS_PROMPT = """Extract any LinkedIn job posting URLs from this email content. 
-The URLs should start with 'https://www.linkedin.com/jobs/view/'.
+EXTRACT_LINKS_PROMPT = """Extract any LinkedIn job posting URLs from this email content.
+Accept URLs that contain either '/jobs/view/' or '/comm/jobs/view/'. URLs may include query parameters or tracking IDs.
 Return only the URLs, one per line. If no URLs found, return 'NO_URLS_FOUND'."""
 
 
@@ -141,7 +141,16 @@ class MainAgent(BaseAgent):
             response = self.model.generate_content(EXTRACT_LINKS_PROMPT + "\n\nEmail content:\n" + email_content)
             urls = response.text.strip().split('\n')
             
-            return [url.strip() for url in urls if url.strip() and url.strip() != 'NO_URLS_FOUND' and 'linkedin.com/jobs/view/' in url.strip()]
+            return [
+                url.strip()
+                for url in urls
+                if url.strip()
+                and url.strip() != 'NO_URLS_FOUND'
+                and (
+                    'linkedin.com/jobs/view/' in url.strip()
+                    or 'linkedin.com/comm/jobs/view/' in url.strip()
+                )
+            ]
             
         except Exception as e:
             self.logger.error(f"Error extracting links: {str(e)}")

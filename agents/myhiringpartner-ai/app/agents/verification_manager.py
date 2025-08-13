@@ -174,6 +174,10 @@ Return your analysis as a single JSON object with the specified structure.
         self.linkedin_scraper = LinkedinScraper(api_key)
         self.bq_client = bigquery.Client()
         self.resumes_table_id = f"{self.bq_client.project}.{self.config.bq_dataset}.resumes"
+        
+        # Initialize matching service
+        from app.agents.matching_service import MatchingService
+        self.matching_service = MatchingService()
 
     def _clean_for_json(self, value):
         if isinstance(value, (date, datetime)):
@@ -360,40 +364,132 @@ Return your analysis as a single JSON object with the specified structure.
 
 
     def run(self, data: dict):
-        candidate_id = data.get('candidate_id')
-        email_data = data.get('email_data')
-        logger.info(f"Starting verification for candidate_id: {candidate_id}")
+        email_data = data.get('email_data', {})
+        
+        # Extract sender email from email_data
+        sender_email = email_data.get('sender') if isinstance(email_data, dict) else None
+        
+        if not sender_email:
+            logger.error("No sender email provided")
+            return {"status": "error", "message": "No sender email provided"}
+        
+        # Extract email address from format "Name <email@domain.com>"
+        email_match = re.search(r'<([^>]+)>', sender_email)
+        if email_match:
+            sender_email = email_match.group(1)
+        else:
+            # If no angle brackets found, assume the whole string is an email
+            sender_email = sender_email.strip()
+        
+        logger.info(f"Starting verification for sender email: {sender_email}")
         
         try:
-            # 1. Fetch resume data from BigQuery
+            # 1. Fetch resume data from BigQuery using sender email
             query = f"""
             SELECT *  
             FROM `{self.resumes_table_id}` 
-            WHERE candidate_id = @candidate_id
+            WHERE candidate_email = @sender_email
+            ORDER BY created_at DESC
+            LIMIT 1
             """
             job_config = bigquery.QueryJobConfig(
                 query_parameters=[
-                    bigquery.ScalarQueryParameter("candidate_id", "STRING", candidate_id)
+                    bigquery.ScalarQueryParameter("sender_email", "STRING", sender_email)
                 ]
             )
             results = self.bq_client.query(query, job_config=job_config).result()
             if results.total_rows == 0:
-                logger.error(f"No resume found for candidate_id: {candidate_id}")
-                return {"status": "error", "message": f"No resume found for candidate_id: {candidate_id}"}
+                logger.error(f"No resume found for sender email: {sender_email}")
+                return {"status": "error", "message": f"No resume found for sender email: {sender_email}"}
             
             resume_data = dict(next(iter(results)))
+            candidate_id = resume_data.get('candidate_id')
             
-            # 2. If email data is present, extract LinkedIn URL
+            if not candidate_id:
+                logger.error(f"No candidate_id found in resume data for email: {sender_email}")
+                return {"status": "error", "message": f"No candidate_id found for email: {sender_email}"}
+            
+            logger.info(f"Found candidate_id: {candidate_id} for email: {sender_email}")
+            
+            # 2. If email data is present, extract LinkedIn URL and other info
             linkedin_url_from_email = None
-            if email_data and email_data.body:
-                linkedin_url_match = re.search(r'(https?://(?:www\.)?linkedin\.com/in/[\S]+)', email_data.body, re.IGNORECASE)
+            date_of_birth_from_email = None
+            location_from_email = None
+            
+            if email_data and email_data.get('body'):
+                email_body = email_data.get('body', '')
+                # Extract LinkedIn URL
+                linkedin_url_match = re.search(r'(https?://(?:www\.)?linkedin\.com/in/[\S]+)', email_body, re.IGNORECASE)
                 if linkedin_url_match:
                     linkedin_url_from_email = linkedin_url_match.group(1)
                     # Update the resume_data in memory for this run
                     resume_data['linkedin_url'] = linkedin_url_from_email
                     logger.info(f"Found LinkedIn URL in email body: {linkedin_url_from_email}")
+                
+                # Extract date of birth (various formats)
+                dob_patterns = [
+                    r'(?:date of birth|dob|born)[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{4})',
+                    r'(?:date of birth|dob|born)[:\s]*(\d{4}[/-]\d{1,2}[/-]\d{1,2})',
+                    r'(\d{1,2}[/-]\d{1,2}[/-]\d{4})',
+                    r'(\d{4}[/-]\d{1,2}[/-]\d{1,2})'
+                ]
+                for pattern in dob_patterns:
+                    dob_match = re.search(pattern, email_body, re.IGNORECASE)
+                    if dob_match:
+                        date_of_birth_from_email = dob_match.group(1)
+                        resume_data['date_of_birth'] = date_of_birth_from_email
+                        logger.info(f"Found date of birth in email: {date_of_birth_from_email}")
+                        break
+                
+                # Extract location - Modified to handle "Location:" format and avoid capturing email headers
+                location_patterns = [
+                    r'Location:\s*([^.\n<]+)',  # Matches "Location: place"
+                    r'(?:live in|based in|from):\s*([^.\n<]+)',  # Matches "live in: place"
+                    r'(?:city|state):\s*([^.\n<]+)'  # Matches "city: place"
+                ]
+                for pattern in location_patterns:
+                    location_match = re.search(pattern, email_body, re.IGNORECASE)
+                    if location_match:
+                        location_from_email = location_match.group(1).strip()
+                        resume_data['candidate_location'] = location_from_email
+                        logger.info(f"Found location in email: {location_from_email}")
+                        break
 
-            # 3. Use the potentially updated LinkedIn URL for verification
+            # 3. Update BigQuery with any new information found in email
+            if linkedin_url_from_email or date_of_birth_from_email or location_from_email:
+                self._update_candidate_info_from_email(candidate_id, linkedin_url_from_email, date_of_birth_from_email, location_from_email)
+                logger.info(f"Successfully updated candidate info for {candidate_id}")
+                
+                # Call workflow2 after successful update
+                try:
+                    logger.info(f"Initiating workflow2_resume_to_jds for candidate_id={candidate_id}")
+                    match_result = self.matching_service.workflow2_resume_to_jds(candidate_id)
+                    return {
+                        "status": "success",
+                        "message": "Successfully updated candidate information and completed matching",
+                        "candidate_id": candidate_id,
+                        "updates": {
+                            "linkedin_url": linkedin_url_from_email,
+                            "date_of_birth": date_of_birth_from_email,
+                            "location": location_from_email
+                        },
+                        "matching_result": match_result
+                    }
+                except Exception as e:
+                    logger.error(f"Error in workflow2_resume_to_jds for candidate_id={candidate_id}: {e}", exc_info=True)
+                    return {
+                        "status": "partial_success",
+                        "message": "Successfully updated candidate information but matching failed",
+                        "candidate_id": candidate_id,
+                        "updates": {
+                            "linkedin_url": linkedin_url_from_email,
+                            "date_of_birth": date_of_birth_from_email,
+                            "location": location_from_email
+                        },
+                        "matching_error": str(e)
+                    }
+
+            # 4. Use the potentially updated LinkedIn URL for verification
             linkedin_url_to_use = resume_data.get('linkedin_url')
             verification_result = None
 
@@ -418,6 +514,7 @@ Return your analysis as a single JSON object with the specified structure.
 
             verification_result = json.loads(json_str)
             logger.info(f"Received verification JSON from AI: {json.dumps(verification_result, indent=2)}")
+            candidate_name = resume_data.get('name', '') or resume_data.get('full_name', '') or candidate_id
 
             if verification_result:
                 update_success = self._update_verification_data_in_bq(candidate_id, verification_result)
@@ -446,7 +543,9 @@ Return your analysis as a single JSON object with the specified structure.
 
             return {
                 "status": "success",
-                "verification": verification_result
+                "verification": verification_result,
+                "candidate_id": candidate_id,
+                "sender_email": sender_email
             }
 
         except Exception as e:
@@ -456,3 +555,39 @@ Return your analysis as a single JSON object with the specified structure.
                 "message": "Verification process failed",
                 "details": str(e)
             }
+
+    def _update_candidate_info_from_email(self, candidate_id: str, linkedin_url: str = None, date_of_birth: str = None, location: str = None):
+        """Update candidate information in BigQuery from email content."""
+        logger.info(f"Updating candidate info for {candidate_id} from email")
+        
+        update_fields = []
+        query_params = [bigquery.ScalarQueryParameter("candidate_id", "STRING", candidate_id)]
+        
+        if linkedin_url:
+            update_fields.append("linkedin_url = @linkedin_url")
+            query_params.append(bigquery.ScalarQueryParameter("linkedin_url", "STRING", linkedin_url))
+        
+        if date_of_birth:
+            update_fields.append("date_of_birth = @date_of_birth")
+            query_params.append(bigquery.ScalarQueryParameter("date_of_birth", "STRING", date_of_birth))
+        
+        if location:
+            update_fields.append("candidate_location = @location")
+            query_params.append(bigquery.ScalarQueryParameter("location", "STRING", location))
+        
+        if not update_fields:
+            return
+        
+        update_query = f"""
+        UPDATE `{self.resumes_table_id}`
+        SET {', '.join(update_fields)}, updated_at = CURRENT_TIMESTAMP()
+        WHERE candidate_id = @candidate_id
+        """
+        
+        job_config = bigquery.QueryJobConfig(query_parameters=query_params)
+        
+        try:
+            self.bq_client.query(update_query, job_config=job_config).result()
+            logger.info(f"Successfully updated candidate info for {candidate_id}")
+        except Exception as e:
+            logger.error(f"Failed to update candidate info for {candidate_id}: {e}")

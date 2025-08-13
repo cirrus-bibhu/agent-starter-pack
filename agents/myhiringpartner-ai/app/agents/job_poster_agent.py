@@ -30,7 +30,7 @@ from email.mime.multipart import MIMEMultipart
 import logging
 
 EXTRACT_JOB_LINK_PROMPT = """Extract the LinkedIn job posting URL from this email. Return only the URL, nothing else.
-The URL should start with 'https://www.linkedin.com/jobs/view/'.
+Accept URLs that contain either '/jobs/view/' or '/comm/jobs/view/' and may include query parameters or tracking IDs.
 If multiple URLs are found, return the one most likely to be the job posting.
 If no URL is found, return 'NO_URL_FOUND'."""
 
@@ -362,7 +362,25 @@ class JobPosterAgent(BaseAgent):
 
             response = self.model.generate_content(EXTRACT_JOB_LINK_PROMPT + "\n\nEmail content:\n" + email_content)
             url = response.text.strip()
-            return url if url != 'NO_URL_FOUND' and 'linkedin.com/jobs/view/' in url else None
+
+            # Validate LLM-returned URL first
+            if url != 'NO_URL_FOUND' and (
+                'linkedin.com/jobs/view/' in url or 'linkedin.com/comm/jobs/view/' in url
+            ):
+                return url
+
+            # Fallback: regex parse from the raw email subject/body
+            try:
+                combined = f"{email_data.subject}\n{email_data.body}"
+                pattern = r"https?://www\.linkedin\.com/(?:comm/)?jobs/view/[^\s>\)\]\"']+"
+                match = re.search(pattern, combined)
+                if match:
+                    found = match.group(0)
+                    return found
+            except Exception:
+                pass
+
+            return None
         except Exception as e:
             self.logger.error(f"Error extracting job link: {str(e)}")
             return None
@@ -370,7 +388,8 @@ class JobPosterAgent(BaseAgent):
     def _extract_linkedin_job_id(self, url: str) -> str:
         if not url:
             return None
-        match = re.search(r"/jobs/view/(\d+)/?", url)
+        pattern = r"/(?:comm/)?jobs/view/(?:[\w\-]*-)?(\d+)(?:[/?#]|$)"
+        match = re.search(pattern, url)
         if match:
             job_id = match.group(1)
             self.logger.info(f"Extracted LinkedIn job ID: {job_id}")
@@ -958,26 +977,49 @@ Additional Information:
             'job_location_city', 'job_location_state', 'job_location_country',
             'is_relocation_allowed', 'is_remote'
         ]
+        # If a combined 'location' string is present, do not request city/state/country separately
+        combined_location = (job_details.get('location') or '').strip()
+
         for field in basic_fields:
             value = job_details.get(field)
-            # A field is missing if it's None, or the string 'not specified', or a boolean False
-            is_missing_str = isinstance(value, str) and value.lower().strip() == "not specified"
-            is_missing_bool = isinstance(value, bool) and not value
-            is_missing_none = value is None
 
-            if is_missing_str or is_missing_bool or is_missing_none:
+            # Treat explicit booleans (True or False) as present; only None or "not specified" is missing
+            if field in ('is_relocation_allowed', 'is_remote'):
+                if value is None or (isinstance(value, str) and value.lower().strip() == 'not specified'):
+                    missing_info['basic_info'].append(field)
+                continue
+
+            # For location components, consider them satisfied if a combined 'location' exists
+            if field in ('job_location_city', 'job_location_state', 'job_location_country') and combined_location:
+                continue
+
+            is_missing_none = value is None
+            is_missing_str = isinstance(value, str) and value.lower().strip() == 'not specified'
+
+            if is_missing_none or is_missing_str:
                 missing_info['basic_info'].append(field)
 
         # Check vendor information based on customer type
         customer_type = (job_details.get('customer_type') or 'not specified').lower()
+        # Helper to check missing string fields safely
+        def _is_missing_str_field(val: Any) -> bool:
+            return val is None or (isinstance(val, str) and val.lower().strip() == 'not specified') or (isinstance(val, str) and val.strip() == '')
+
         if customer_type == 'prime_vendor':
-            if not job_details.get('end_client_name') or job_details.get('end_client_name', '').lower() == 'not specified':
+            if _is_missing_str_field(job_details.get('end_client_name')):
                 missing_info['vendor_info'].append('end_client_name')
+            # Also request end-client email if not present
+            if _is_missing_str_field(job_details.get('end_client_email')):
+                missing_info['vendor_info'].append('end_client_email')
         elif customer_type == 'sub_vendor':
-            if not job_details.get('end_client_name') or job_details.get('end_client_name', '').lower() == 'not specified':
+            if _is_missing_str_field(job_details.get('end_client_name')):
                 missing_info['vendor_info'].append('end_client_name')
-            if not job_details.get('prime_vendor_name') or job_details.get('prime_vendor_name', '').lower() == 'not specified':
+            if _is_missing_str_field(job_details.get('end_client_email')):
+                missing_info['vendor_info'].append('end_client_email')
+            if _is_missing_str_field(job_details.get('prime_vendor_name')):
                 missing_info['vendor_info'].append('prime_vendor_name')
+            if _is_missing_str_field(job_details.get('prime_vendor_email')):
+                missing_info['vendor_info'].append('prime_vendor_email')
 
         return missing_info
 
@@ -996,14 +1038,60 @@ Additional Information:
             with open(template_path, 'r') as f:
                 template_str = f.read()
 
-            # Generate HTML table rows for missing fields
+            # Generate HTML rows only for truly missing fields,
+            # grouping location components to keep the email concise.
+            response_cell_style = 'border: 1px solid #ccc; background-color: #f9f9f9; height: 25px;'
+
             table_rows = []
-            all_missing_fields = missing_info.get('basic_info', []) + missing_info.get('vendor_info', [])
-            for field in all_missing_fields:
-                field_name = field.replace('_', ' ').title()
-                # Style the response cell to look like an input field for a better call to action
-                response_cell_style = 'border: 1px solid #ccc; background-color: #f9f9f9; height: 25px;'
-                table_rows.append(f'<tr><td style="padding-right: 15px;">{field_name}</td><td style="{response_cell_style}"></td></tr>')
+
+            basic_missing = list(missing_info.get('basic_info', []) or [])
+            vendor_missing = list(missing_info.get('vendor_info', []) or [])
+
+            # Group location pieces into one concise row if any are missing
+            location_keys = ['job_location_city', 'job_location_state', 'job_location_country']
+            missing_location_parts = [
+                ('City', 'job_location_city') if 'job_location_city' in basic_missing else None,
+                ('State', 'job_location_state') if 'job_location_state' in basic_missing else None,
+                ('Country', 'job_location_country') if 'job_location_country' in basic_missing else None,
+            ]
+            missing_location_parts = [p for p in missing_location_parts if p]
+
+            if missing_location_parts:
+                # Remove individual keys so we don't duplicate them below
+                for _, key in missing_location_parts:
+                    if key in basic_missing:
+                        basic_missing.remove(key)
+                parts_label = ", ".join([p[0] for p in missing_location_parts])
+                table_rows.append(
+                    f'<tr><td style="padding-right: 15px;">Location ({parts_label})</td>'
+                    f'<td style="{response_cell_style}"></td></tr>'
+                )
+
+            # Map for clearer labels
+            field_labels = {
+                'is_remote': 'Remote (Yes/No)',
+                'is_relocation_allowed': 'Relocation Allowed (Yes/No)',
+                'end_client_name': 'End Client Name',
+                'end_client_email': 'End Client Email',
+                'prime_vendor_name': 'Prime Vendor Name',
+                'prime_vendor_email': 'Prime Vendor Email',
+            }
+
+            # Add remaining basic missing fields (excluding location already handled)
+            for field in basic_missing:
+                label = field_labels.get(field, field.replace('_', ' ').title())
+                table_rows.append(
+                    f'<tr><td style="padding-right: 15px;">{label}</td>'
+                    f'<td style="{response_cell_style}"></td></tr>'
+                )
+
+            # Add vendor-related missing fields
+            for field in vendor_missing:
+                label = field_labels.get(field, field.replace('_', ' ').title())
+                table_rows.append(
+                    f'<tr><td style="padding-right: 15px;">{label}</td>'
+                    f'<td style="{response_cell_style}"></td></tr>'
+                )
 
             missing_fields_table = "\n".join(table_rows)
 
@@ -1014,7 +1102,7 @@ Additional Information:
 
             # The subject is part of the template's title, but we can return it separately if needed.
             # For now, let's create a full email string with subject.
-            subject = f"Follow-up for Job Posting: {job_title}"
+            subject = f"Quick follow-up: {job_title}"
             
             # Mimic an email format with headers and body
             to_email = job_details.get('recruiter_email')

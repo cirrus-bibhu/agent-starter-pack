@@ -160,19 +160,26 @@ class ResumeProcessorAgent(BaseAgent):
         if not isinstance(education, list):
             education = []
 
-        # Check for bachelor's degree
+        # Check for bachelor's degree (handle None values safely)
+        def _norm_degree(e: Any) -> str:
+            try:
+                if not isinstance(e, dict):
+                    return ""
+                v = e.get("degree")
+                return (v or "").strip().lower()
+            except Exception:
+                return ""
+
         has_bachelors = any(
-            edu.get("degree", "").lower().startswith("bachelor") 
-            or edu.get("degree", "").lower().startswith("b.") 
+            _norm_degree(edu).startswith("bachelor") or _norm_degree(edu).startswith("b.")
             for edu in education
         )
         if not has_bachelors:
             missing_info["bachelors"] = "Bachelor's degree details"
 
-        # Check for master's degree
+        # Check for master's degree (handle None values safely)
         has_masters = any(
-            edu.get("degree", "").lower().startswith("master")
-            or edu.get("degree", "").lower().startswith("m.")
+            _norm_degree(edu).startswith("master") or _norm_degree(edu).startswith("m.")
             for edu in education
         )
         if not has_masters:
@@ -187,18 +194,23 @@ class ResumeProcessorAgent(BaseAgent):
         """Generates an email to the candidate requesting missing information."""
         template = self.jinja_env.get_template('candidate_followup_email.html')
 
-        # Transform education data for the template
+        # Transform education data for the template (handle None values safely)
+        def _norm_degree(e: Any) -> str:
+            try:
+                if not isinstance(e, dict):
+                    return ""
+                v = e.get("degree")
+                return (v or "").strip().lower()
+            except Exception:
+                return ""
+
+        education_list = resume_data.get('education', [])
+        if not isinstance(education_list, list):
+            education_list = []
+
         education_template_data = {
-            'bachelors': any(
-                edu.get("degree", "").lower().startswith("bachelor")
-                or edu.get("degree", "").lower().startswith("b.")
-                for edu in resume_data.get('education', [])
-            ),
-            'masters': any(
-                edu.get("degree", "").lower().startswith("master")
-                or edu.get("degree", "").lower().startswith("m.")
-                for edu in resume_data.get('education', [])
-            )
+            'bachelors': any(_norm_degree(edu).startswith("bachelor") or _norm_degree(edu).startswith("b.") for edu in education_list),
+            'masters': any(_norm_degree(edu).startswith("master") or _norm_degree(edu).startswith("m.") for edu in education_list)
         }
 
         html_body = template.render(
@@ -360,13 +372,49 @@ class ResumeProcessorAgent(BaseAgent):
         temp_resume_path = None
         try:
             attachments = email_data.attachments
+            # Backward compatibility: construct attachment from top-level gcs_path if present
+            if (not attachments) and getattr(email_data, 'gcs_path', None):
+                attachments = [{
+                    'storage_path': getattr(email_data, 'gcs_path', None),
+                    'bucket_name': getattr(email_data, 'bucket_name', None),
+                    'filename': 'resume.pdf'
+                }]
+
             if not attachments:
                 self.logger.error("No resume attachment found.")
                 return {"status": "error", "message": "No resume attachment found"}
 
             attachment = attachments[0]
-            pdf_bytes = bytes.fromhex(attachment['content'])
+            pdf_bytes = None
             original_filename = attachment.get('filename', 'resume.pdf')
+
+            # Case 1: inline hex content provided
+            if 'content' in attachment and attachment.get('content'):
+                try:
+                    pdf_bytes = bytes.fromhex(attachment['content'])
+                except Exception as e:
+                    self.logger.warning(f"Failed to decode inline attachment hex content: {e}")
+                    pdf_bytes = None
+
+            # Case 2: GCS reference provided
+            if pdf_bytes is None:
+                storage_path = attachment.get('storage_path') or attachment.get('gcs_path')
+                bucket_name = attachment.get('bucket_name') or getattr(email_data, 'bucket_name', None) or self.bucket_name
+                if storage_path and bucket_name:
+                    try:
+                        blob = self.storage_client.bucket(bucket_name).blob(storage_path)
+                        pdf_bytes = blob.download_as_bytes(timeout=60)
+                        if not original_filename or original_filename == 'resume.pdf':
+                            original_filename = os.path.basename(storage_path) or 'resume.pdf'
+                        self.logger.info(f"Downloaded attachment from gs://{bucket_name}/{storage_path}")
+                    except Exception as e:
+                        self.logger.error(f"Failed to download attachment from gs://{bucket_name}/{storage_path}: {e}")
+                        return {"status": "error", "message": "Failed to download attachment from storage"}
+
+            if pdf_bytes is None:
+                self.logger.error("Attachment content unavailable (no inline content and no valid GCS reference).")
+                return {"status": "error", "message": "Attachment content unavailable"}
+
             temp_resume_path = os.path.join(self.output_dir, f"temp_{original_filename}")
 
             with open(temp_resume_path, 'wb') as f:
