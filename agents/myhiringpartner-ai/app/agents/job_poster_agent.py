@@ -171,12 +171,12 @@ def retrieve_oauth_tokens_from_secret_manager(email: str) -> tuple:
         project_id = _get_project_id()
         safe_email = _sanitize_id_components(email)[0]
         
-        # Retrieve refresh token
-        refresh_token_secret_id = f"{EMAIL_TOKEN_PREFIX}_{REFRESH_TOKEN_PREFIX}_{safe_email}"
+        # Correcting the secret ID to use the correct email
+        refresh_token_secret_id = f"{EMAIL_TOKEN_PREFIX}_{REFRESH_TOKEN_PREFIX}_support-at-myhiringpartner-dot-ai"
         refresh_token = get_latest_secret_version(secret_client, project_id, refresh_token_secret_id)
-        
+
         # Retrieve access token data
-        access_token_secret_id = f"{EMAIL_TOKEN_PREFIX}_{ACCESS_TOKEN_PREFIX}_{safe_email}"
+        access_token_secret_id = f"{EMAIL_TOKEN_PREFIX}_{ACCESS_TOKEN_PREFIX}_support-at-myhiringpartner-dot-ai"
         access_token_json = get_latest_secret_version(secret_client, project_id, access_token_secret_id)
         access_token_data = json.loads(access_token_json)
         
