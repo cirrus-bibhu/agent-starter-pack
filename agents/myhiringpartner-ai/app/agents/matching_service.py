@@ -16,6 +16,7 @@ from ..agent import BaseAgent
 from langchain_google_vertexai import VertexAI
 from vertexai.language_models import TextEmbeddingModel
 import logging
+from typing import Optional
 
 logger = logging.getLogger('Agent.MatchingService')
 
@@ -119,18 +120,52 @@ IF outcome == "Rejected" AND (
           rule_flagged = "Post-Check Adjustment"
 
 ════════  STAGE-3  (JSON RESPONSE)  ════════
-Return **only**:
+Return JSON with the following EXACT shape and key names.
+All arrays must be arrays of strings unless stated. Use true/false for booleans and numbers for scores.
+Do not return null; use empty string "" for optional strings and empty arrays [] when you have no items.
 
 {
-  "outcome": "Moving Forward | Rejected | Requires Clarification",
-  "reason": "<concise text or empty>",
-  "rule_flagged": "Rule # - Name | Post-Check Adjustment",
+  "outcome": "Moving Forward" | "Rejected" | "Requires Clarification",
+  "reason": "<concise text or empty string>",
+  "rule_flagged": "Rule # - Name" | "Post-Check Adjustment" | "",
+
+  "mandatory_requirements": {
+    "skills_requirement_met": true|false,
+    "experience_requirement_met": true|false,
+    "domain_requirement_met": true|false,
+    "education_requirement_met": true|false,
+    "location_requirement_met": true|false
+  },
+
+  "match_scores": {
+    "overall_match_score": <float between 0 and 1>,
+    "skill_match_score": <float between 0 and 1>,
+    "experience_match_score": <float between 0 and 1>,
+    "domain_match_score": <float between 0 and 1>,
+    "education_match_score": <float between 0 and 1>,
+    "location_match_score": <float between 0 and 1>
+  },
+
+  "missing_required_skills": ["..."],
+  "missing_preferred_skills": ["..."],
+  "key_strengths": ["..."],
+  "gaps_and_concerns": ["..."],
+
+  "screening_decision": {
+    "status": "Move Forward" | "Rejected" | "Requires Clarification",
+    "explanation": "<short justification or empty string>",
+    "clarification_questions": ["...", "..."]
+  },
+
+  "interview_recommendation": true|false,
+  "suggested_interview_questions": ["...", "..."],
+
   "is_niche_role": true|false,
   "core_function": "<JD label>",
   "core_profile": "<Résumé label>",
-  "missing_items": [ … ],
-  "stale_skills":  [ … ],
-  "recency_summary": { "skill": "X years ago", … }
+  "missing_items": ["..."],
+  "stale_skills": ["..."],
+  "recency_summary": { "skill": "X years ago" }
 }
 
 Notes  
@@ -509,36 +544,36 @@ class MatchingService(BaseAgent):
 
     def _store_match_results(self, job_id, candidate_id, semantic_score, match_details):
         try:
-            match_id = str(uuid.uuid4())
-            created_at = datetime.utcnow().isoformat()
-
-            row_to_insert = {
-                "match_id": match_id,
-                "job_id": job_id,
-                "candidate_id": candidate_id,
-                "semantic_similarity_score": semantic_score,
-                "created_at": created_at,
-                "updated_at": created_at,
-                "match_status": "Pending Review",
-            }
+            # If a row exists, we'll update it and preserve match_id/created_at.
+            # Otherwise, we'll insert a new row with a fresh match_id and timestamps.
+            new_match_id = str(uuid.uuid4())
+            match_status = "Pending Review"
 
             # Extract rule_flagged from match_details (from LLM response)
             rule_flagged = match_details.get("rule_flagged", "")
             if rule_flagged is None:
                 rule_flagged = ""
-            row_to_insert["rule_flagged"] = rule_flagged
 
             # Map LLM fields to existing schema to avoid unknown-field errors
-            # outcome -> screening_decision.status
-            # reason  -> screening_decision.explanation
+            # Prefer nested screening_decision.*; fall back to legacy top-level fields for backward compatibility
             outcome = match_details.get("outcome") or ""
             reason  = match_details.get("reason") or ""
+            screening_decision = match_details.get("screening_decision") or {}
+            if not isinstance(screening_decision, dict):
+                screening_decision = {}
+            sd_status = screening_decision.get("status") or outcome
+            sd_explanation = screening_decision.get("explanation") or reason
+            sd_clar_qs = screening_decision.get("clarification_questions") or match_details.get("clarification_questions")
 
             # Ensure correct types for BigQuery
             if not isinstance(outcome, str):
                 outcome = str(outcome)
             if not isinstance(reason, str):
                 reason = str(reason)
+            if not isinstance(sd_status, str):
+                sd_status = str(sd_status)
+            if not isinstance(sd_explanation, str):
+                sd_explanation = str(sd_explanation)
 
             # Helpers to coerce types safely
             def _as_bool(v):
@@ -571,52 +606,213 @@ class MatchingService(BaseAgent):
                     out.append(str(x))
                 return out
 
-            screening_decision = {
-                "status": outcome,
-                "explanation": reason,
-                # Optional nested fields from LLM if present
-                "clarification_questions": _as_str_list(match_details.get("clarification_questions")),
-                "interview_recommendation": _as_bool(match_details.get("interview_recommendation")),
-                "suggested_interview_questions": _as_str_list(match_details.get("suggested_interview_questions")),
-            }
-            row_to_insert["screening_decision"] = screening_decision
+            # Prepare all mapped values for MERGE parameters
+            # screening_decision fields
+            sc_status = sd_status
+            sc_explanation = sd_explanation
+            sc_clar_qs = _as_str_list(sd_clar_qs)
+            sc_interview_reco = _as_bool(match_details.get("interview_recommendation"))
+            sc_suggested_qs = _as_str_list(match_details.get("suggested_interview_questions"))
+
+            # match_status should reflect the high-level outcome
+            match_status = outcome or match_status
 
             # Map mandatory_requirements RECORD
             mand = match_details.get("mandatory_requirements", {}) or {}
-            if isinstance(mand, dict):
-                row_to_insert["mandatory_requirements"] = {
-                    "skills_requirement_met": _as_bool(mand.get("skills_requirement_met")),
-                    "experience_requirement_met": _as_bool(mand.get("experience_requirement_met")),
-                    "domain_requirement_met": _as_bool(mand.get("domain_requirement_met")),
-                    "education_requirement_met": _as_bool(mand.get("education_requirement_met")),
-                    "location_requirement_met": _as_bool(mand.get("location_requirement_met")),
-                }
+            mand_skills = _as_bool(mand.get("skills_requirement_met")) if isinstance(mand, dict) else None
+            mand_experience = _as_bool(mand.get("experience_requirement_met")) if isinstance(mand, dict) else None
+            mand_domain = _as_bool(mand.get("domain_requirement_met")) if isinstance(mand, dict) else None
+            mand_education = _as_bool(mand.get("education_requirement_met")) if isinstance(mand, dict) else None
+            mand_location = _as_bool(mand.get("location_requirement_met")) if isinstance(mand, dict) else None
 
             # Map match_scores RECORD
             scores = match_details.get("match_scores", {}) or {}
-            if isinstance(scores, dict):
-                row_to_insert["match_scores"] = {
-                    "overall_match_score": _as_float(scores.get("overall_match_score")),
-                    "skill_match_score": _as_float(scores.get("skill_match_score")),
-                    "experience_match_score": _as_float(scores.get("experience_match_score")),
-                    "domain_match_score": _as_float(scores.get("domain_match_score")),
-                    "education_match_score": _as_float(scores.get("education_match_score")),
-                    "location_match_score": _as_float(scores.get("location_match_score")),
+            sc_overall = _as_float(scores.get("overall_match_score")) if isinstance(scores, dict) else None
+            sc_skill = _as_float(scores.get("skill_match_score")) if isinstance(scores, dict) else None
+            sc_experience = _as_float(scores.get("experience_match_score")) if isinstance(scores, dict) else None
+            sc_domain = _as_float(scores.get("domain_match_score")) if isinstance(scores, dict) else None
+            sc_education = _as_float(scores.get("education_match_score")) if isinstance(scores, dict) else None
+            sc_location = _as_float(scores.get("location_match_score")) if isinstance(scores, dict) else None
+
+            # Repeated string fields
+            arr_missing_required = _as_str_list(match_details.get("missing_required_skills"))
+            arr_missing_preferred = _as_str_list(match_details.get("missing_preferred_skills"))
+            arr_key_strengths = _as_str_list(match_details.get("key_strengths"))
+            arr_gaps_concerns = _as_str_list(match_details.get("gaps_and_concerns"))
+
+            # Retrieve existing match_id if present to return a stable id on updates
+            existing_id = None
+            try:
+                q = f"""
+                SELECT match_id FROM `{self.project_id}.{self.dataset_id}.{self.match_table_name}`
+                WHERE job_id = @job_id AND candidate_id = @candidate_id
+                LIMIT 1
+                """
+                cfg = bigquery.QueryJobConfig(query_parameters=[
+                    bigquery.ScalarQueryParameter("job_id", "STRING", job_id),
+                    bigquery.ScalarQueryParameter("candidate_id", "STRING", candidate_id),
+                ])
+                res = list(self.bq_client.query(q, job_config=cfg).result())
+                if res:
+                    existing_id = res[0]["match_id"]
+            except Exception:
+                existing_id = None
+
+            # Dynamically build MERGE to avoid failing when some columns are absent in live schema
+            # Discover available top-level columns
+            cols_query = f"""
+            SELECT column_name
+            FROM `{self.project_id}.{self.dataset_id}.INFORMATION_SCHEMA.COLUMNS`
+            WHERE table_name = '{self.match_table_name}'
+            """
+            try:
+                cols_res = list(self.bq_client.query(cols_query).result())
+                available_cols = {row["column_name"] for row in cols_res}
+            except Exception:
+                # If discovery fails, assume minimal set
+                available_cols = set()
+
+            has_top_ir = "interview_recommendation" in available_cols
+            has_top_siq = "suggested_interview_questions" in available_cols
+
+            update_parts = [
+                "semantic_similarity_score = @semantic_similarity_score",
+                "mandatory_requirements = STRUCT(\n                @mand_skills AS skills_requirement_met,\n                @mand_experience AS experience_requirement_met,\n                @mand_domain AS domain_requirement_met,\n                @mand_education AS education_requirement_met,\n                @mand_location AS location_requirement_met\n              )",
+                "match_scores = STRUCT(\n                @sc_overall AS overall_match_score,\n                @sc_skill AS skill_match_score,\n                @sc_experience AS experience_match_score,\n                @sc_domain AS domain_match_score,\n                @sc_education AS education_match_score,\n                @sc_location AS location_match_score\n              )",
+                "missing_required_skills = @arr_missing_required",
+                "missing_preferred_skills = @arr_missing_preferred",
+                "key_strengths = @arr_key_strengths",
+                "gaps_and_concerns = @arr_gaps_concerns",
+                "screening_decision = STRUCT(\n                @sc_status AS status,\n                @sc_explanation AS explanation,\n                @sc_clar_qs AS clarification_questions,\n                @sc_interview_reco AS interview_recommendation,\n                @sc_suggested_qs AS suggested_interview_questions\n              )",
+                "match_status = @match_status",
+                "rule_flagged = @rule_flagged",
+                "updated_at = CURRENT_TIMESTAMP()",
+            ]
+
+            if has_top_ir:
+                update_parts.insert(-3, "interview_recommendation = @sc_interview_reco")
+            if has_top_siq:
+                update_parts.insert(-3 if has_top_ir else -3, "suggested_interview_questions = @sc_suggested_qs")
+
+            insert_columns = [
+                "match_id", "job_id", "candidate_id",
+                "semantic_similarity_score", "mandatory_requirements", "match_scores",
+                "missing_required_skills", "missing_preferred_skills", "key_strengths", "gaps_and_concerns",
+                "screening_decision",
+            ]
+            if has_top_ir:
+                insert_columns.append("interview_recommendation")
+            if has_top_siq:
+                insert_columns.append("suggested_interview_questions")
+            insert_columns += ["match_status", "rule_flagged", "created_at", "updated_at"]
+
+            insert_values = [
+                "@match_id", "@job_id", "@candidate_id",
+                "@semantic_similarity_score",
+                "STRUCT(@mand_skills, @mand_experience, @mand_domain, @mand_education, @mand_location)",
+                "STRUCT(@sc_overall, @sc_skill, @sc_experience, @sc_domain, @sc_education, @sc_location)",
+                "@arr_missing_required", "@arr_missing_preferred", "@arr_key_strengths", "@arr_gaps_concerns",
+                "STRUCT(@sc_status, @sc_explanation, @sc_clar_qs, @sc_interview_reco, @sc_suggested_qs)",
+            ]
+            if has_top_ir:
+                insert_values.append("@sc_interview_reco")
+            if has_top_siq:
+                insert_values.append("@sc_suggested_qs")
+            insert_values += ["@match_status", "@rule_flagged", "CURRENT_TIMESTAMP()", "CURRENT_TIMESTAMP()"]
+
+            # Precompute SQL fragments to avoid backslashes inside f-string expressions
+            update_sql = ',\n              '.join(update_parts)
+            insert_cols_sql = ', '.join(insert_columns)
+            insert_vals_sql = ', '.join(insert_values)
+
+            merge_sql = f"""
+            MERGE `{self.project_id}.{self.dataset_id}.{self.match_table_name}` T
+            USING (SELECT @job_id AS job_id, @candidate_id AS candidate_id) S
+            ON T.job_id = S.job_id AND T.candidate_id = S.candidate_id
+            WHEN MATCHED THEN UPDATE SET
+              {update_sql}
+            WHEN NOT MATCHED THEN INSERT (
+              {insert_cols_sql}
+            ) VALUES (
+              {insert_vals_sql}
+            )
+            """
+
+            params = [
+                bigquery.ScalarQueryParameter("job_id", "STRING", job_id),
+                bigquery.ScalarQueryParameter("candidate_id", "STRING", candidate_id),
+                bigquery.ScalarQueryParameter("match_id", "STRING", new_match_id),
+                bigquery.ScalarQueryParameter("semantic_similarity_score", "FLOAT64", float(semantic_score)),
+                bigquery.ScalarQueryParameter("mand_skills", "BOOL", mand_skills),
+                bigquery.ScalarQueryParameter("mand_experience", "BOOL", mand_experience),
+                bigquery.ScalarQueryParameter("mand_domain", "BOOL", mand_domain),
+                bigquery.ScalarQueryParameter("mand_education", "BOOL", mand_education),
+                bigquery.ScalarQueryParameter("mand_location", "BOOL", mand_location),
+                bigquery.ScalarQueryParameter("sc_overall", "FLOAT64", sc_overall),
+                bigquery.ScalarQueryParameter("sc_skill", "FLOAT64", sc_skill),
+                bigquery.ScalarQueryParameter("sc_experience", "FLOAT64", sc_experience),
+                bigquery.ScalarQueryParameter("sc_domain", "FLOAT64", sc_domain),
+                bigquery.ScalarQueryParameter("sc_education", "FLOAT64", sc_education),
+                bigquery.ScalarQueryParameter("sc_location", "FLOAT64", sc_location),
+                bigquery.ArrayQueryParameter("arr_missing_required", "STRING", arr_missing_required),
+                bigquery.ArrayQueryParameter("arr_missing_preferred", "STRING", arr_missing_preferred),
+                bigquery.ArrayQueryParameter("arr_key_strengths", "STRING", arr_key_strengths),
+                bigquery.ArrayQueryParameter("arr_gaps_concerns", "STRING", arr_gaps_concerns),
+                bigquery.ScalarQueryParameter("sc_status", "STRING", sc_status),
+                bigquery.ScalarQueryParameter("sc_explanation", "STRING", sc_explanation),
+                bigquery.ArrayQueryParameter("sc_clar_qs", "STRING", sc_clar_qs),
+                bigquery.ScalarQueryParameter("sc_interview_reco", "BOOL", sc_interview_reco),
+                bigquery.ArrayQueryParameter("sc_suggested_qs", "STRING", sc_suggested_qs),
+                bigquery.ScalarQueryParameter("match_status", "STRING", match_status),
+                bigquery.ScalarQueryParameter("rule_flagged", "STRING", rule_flagged),
+            ]
+
+            job_config = bigquery.QueryJobConfig(query_parameters=params)
+
+            # Debug: Log sanitized payload snapshot before MERGE
+            try:
+                debug_payload = {
+                    "job_id": job_id,
+                    "candidate_id": candidate_id,
+                    "semantic_similarity_score": semantic_score,
+                    "rule_flagged": rule_flagged,
+                    "screening_decision": {
+                        "status": sc_status,
+                        "explanation": sc_explanation,
+                        "clarification_questions": sc_clar_qs[:5],
+                    },
+                    "interview_recommendation": sc_interview_reco,
+                    "suggested_interview_questions": sc_suggested_qs[:5],
+                    "mandatory_requirements": {
+                        "skills_requirement_met": mand_skills,
+                        "experience_requirement_met": mand_experience,
+                        "domain_requirement_met": mand_domain,
+                        "education_requirement_met": mand_education,
+                        "location_requirement_met": mand_location,
+                    },
+                    "match_scores": {
+                        "overall_match_score": sc_overall,
+                        "skill_match_score": sc_skill,
+                        "experience_match_score": sc_experience,
+                        "domain_match_score": sc_domain,
+                        "education_match_score": sc_education,
+                        "location_match_score": sc_location,
+                    },
+                    "missing_required_skills": arr_missing_required[:10],
+                    "missing_preferred_skills": arr_missing_preferred[:10],
+                    "key_strengths": arr_key_strengths[:10],
+                    "gaps_and_concerns": arr_gaps_concerns[:10],
+                    "match_status": match_status,
                 }
+                logger.debug("Upserting match with payload: " + json.dumps(debug_payload)[:1500])
+            except Exception:
+                pass
 
-            # Map repeated string fields
-            row_to_insert["missing_required_skills"] = _as_str_list(match_details.get("missing_required_skills"))
-            row_to_insert["missing_preferred_skills"] = _as_str_list(match_details.get("missing_preferred_skills"))
-            row_to_insert["key_strengths"] = _as_str_list(match_details.get("key_strengths"))
-            row_to_insert["gaps_and_concerns"] = _as_str_list(match_details.get("gaps_and_concerns"))
+            query_job = self.bq_client.query(merge_sql, job_config=job_config)
+            query_job.result()
 
-            errors = self.bq_client.insert_rows_json(f"{self.project_id}.{self.dataset_id}.{self.match_table_name}", [row_to_insert])
-            if errors:
-                logger.error(f"Failed to insert match result into BigQuery: {errors}")
-                raise Exception(f"Failed to insert match result into BigQuery: {errors}")
-            
-            logger.debug(f"Stored match result with match_id={match_id}")
-            return match_id
+            # Return the existing match_id if present, else the newly created one
+            return existing_id or new_match_id
 
         except Exception as e:
             logger.error(f"Error storing match results: {str(e)}", exc_info=True)
@@ -644,6 +840,25 @@ class MatchingService(BaseAgent):
         except Exception as e:
             logger.error(f"Error checking for existing match: {str(e)}", exc_info=True)
             return False
+
+    def _touch_existing_match(self, job_id, candidate_id):
+        """Update only the updated_at field for an existing match row.
+
+        This avoids creating duplicate rows while marking the record as recently processed.
+        """
+        query = f"""
+        UPDATE `{self.project_id}.{self.dataset_id}.{self.match_table_name}`
+        SET updated_at = CURRENT_TIMESTAMP()
+        WHERE job_id = @job_id AND candidate_id = @candidate_id
+        """
+        query_params = [
+            bigquery.ScalarQueryParameter("job_id", "STRING", job_id),
+            bigquery.ScalarQueryParameter("candidate_id", "STRING", candidate_id),
+        ]
+        job_config = bigquery.QueryJobConfig(query_parameters=query_params)
+        logger.debug(f"Touching existing match updated_at for candidate_id={candidate_id}, job_id={job_id}")
+        query_job = self.bq_client.query(query, job_config=job_config)
+        query_job.result()
 
     def _vector_search_jds_query(self, query_embedding, limit=20):
         """Performs a vector search on the job postings table."""
@@ -673,12 +888,57 @@ class MatchingService(BaseAgent):
             logger.error(f"Error performing vector search on JDs: {str(e)}", exc_info=True)
             return []
 
-    def workflow2_resume_to_jds(self, candidate_id, metadata_filters=None, limit=10):
-        """
-        Workflow to match a single resume (by candidate_id) against all job descriptions.
+    def _find_job_id_by_title(self, job_title: str) -> Optional[str]:
+        """Try to resolve a job_id from a job title string using a case-insensitive LIKE query.
+
+        Returns the most recently posted matching job_id or None if no match.
         """
         try:
-            logger.info(f"workflow2 start: candidate_id={candidate_id}, limit={limit}")
+            if not job_title or not isinstance(job_title, str):
+                return None
+
+            # Simple sanitization and wildcard search
+            clean_title = job_title.strip().lower()
+            # Use LIKE with wildcards around the title terms to allow partial matches
+            like_pattern = f"%{clean_title}%"
+
+            query = f"""
+            SELECT job_id
+            FROM `{self.project_id}.{self.dataset_id}.{self.jd_table_name}`
+            WHERE LOWER(job_title) LIKE @like_pattern
+            ORDER BY posting_date DESC
+            LIMIT 1
+            """
+
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("like_pattern", "STRING", like_pattern)
+                ]
+            )
+
+            results = list(self.bq_client.query(query, job_config=job_config).result())
+            if not results:
+                self.logger.debug(f"No JD found matching title pattern: {clean_title}")
+                return None
+
+            row = results[0]
+            return row.get("job_id")
+        except Exception as e:
+            # Do not raise — return None to allow coordinator fallback
+            try:
+                self.logger.debug(f"Error finding job_id by title '{job_title}': {e}")
+            except Exception:
+                pass
+            return None
+
+    def workflow2_resume_to_jds(self, candidate_id, metadata_filters=None, limit=10, job_id=None):
+        """
+        Workflow to match a single resume (by candidate_id) against job descriptions.
+        If job_id is provided, match the resume only against that single job.
+        Otherwise, perform a vector search across all JDs (existing behavior).
+        """
+        try:
+            logger.info(f"workflow2 start: candidate_id={candidate_id}, limit={limit}, job_id={job_id}")
             logger.debug("Fetching resume data for candidate")
             resume_data = self._fetch_resume_data(candidate_id)
             if not resume_data:
@@ -699,7 +959,88 @@ class MatchingService(BaseAgent):
                 if not resume_embedding:
                     return {"error": "Failed to generate and store resume embedding."}
 
-            # Rest of the method remains the same
+            # If a specific job_id is provided, match only against that job
+            if job_id:
+                logger.debug(f"Running single-JD match for job_id={job_id}")
+                jd_data = self._fetch_jd_data(job_id)
+                if not jd_data:
+                    logger.warning(f"Could not fetch data for job_id {job_id}")
+                    return {
+                        "candidate_id": candidate_id,
+                        "candidate_name": candidate_name,
+                        "total_jobs_processed": 0,
+                        "matches": [],
+                        "error": f"Job with job_id {job_id} not found."
+                    }
+
+                jd_embedding = jd_data.get("embeddings")
+                if not jd_embedding:
+                    logger.info(f"JD embedding not found for job_id={job_id}, generating a new one.")
+                    jd_text = jd_data.get("job_summary") or jd_data.get("job_description") or ""
+                    if not jd_text:
+                        logger.warning(f"No text available to generate embedding for job_id={job_id}")
+                        return {
+                            "candidate_id": candidate_id,
+                            "candidate_name": candidate_name,
+                            "total_jobs_processed": 0,
+                            "matches": [],
+                            "error": "Job text empty, cannot generate embedding."
+                        }
+                    jd_embedding = self._generate_and_store_embedding(
+                        jd_text, self.jd_table_name, "job_id", job_id
+                    )
+                    if not jd_embedding:
+                        return {"error": "Failed to generate and store JD embedding."}
+
+                # Calculate semantic similarity between the resume and the single JD
+                semantic_score = self._calculate_semantic_match(jd_embedding, resume_embedding)
+                logger.info(f"Single-JD LLM match: candidate_id={candidate_id}, job_id={job_id}, semantic_score={semantic_score:.4f}")
+
+                # Fetch full resume data for detailed match
+                full_resume_data = self._fetch_resume_data(candidate_id)
+                if not full_resume_data:
+                    logger.warning(f"Could not fetch full resume data for {candidate_id}")
+                    return {
+                        "candidate_id": candidate_id,
+                        "candidate_name": candidate_name,
+                        "total_jobs_processed": 0,
+                        "matches": [],
+                        "error": "Full resume data missing after embedding generation."
+                    }
+
+                try:
+                    match_details = self._detailed_llm_match(jd_data, full_resume_data)
+                    match_results = []
+                    match_id = self._store_match_results(job_id, candidate_id, semantic_score, match_details)
+                    if match_id:
+                        match_results.append({
+                            "match_id": match_id,
+                            "job_id": job_id,
+                            "candidate_id": candidate_id,
+                            "candidate_name": candidate_name,
+                            "semantic_score": semantic_score,
+                            "match_details": match_details
+                        })
+
+                    logger.info(f"workflow2 single-JD complete: candidate_id={candidate_id}, job_id={job_id}, matches={len(match_results)}")
+                    return {
+                        "candidate_id": candidate_id,
+                        "candidate_name": candidate_name,
+                        "total_jobs_processed": 1,
+                        "matches": match_results,
+                    }
+
+                except Exception as match_error:
+                    logger.error(f"Error processing single-job match for candidate {candidate_id}: {str(match_error)}", exc_info=True)
+                    return {
+                        "candidate_id": candidate_id,
+                        "candidate_name": candidate_name,
+                        "total_jobs_processed": 1,
+                        "matches": [],
+                        "error": str(match_error)
+                    }
+
+            # Rest of the method remains the same (vector search across all JDs)
             logger.debug("Running JD vector search for candidate")
             vector_results = self._vector_search_jds_query(resume_embedding, limit=limit)
             if not vector_results:
@@ -710,9 +1051,23 @@ class MatchingService(BaseAgent):
                     "matches": []
                 }
 
-            logger.debug(f"Vector search returned {len(vector_results)} results")
+            # Deduplicate results by job_id
+            seen_job_ids = set()
+            unique_results = []
+            for r in vector_results:
+                jid = r.get("job_id")
+                if jid in seen_job_ids:
+                    continue
+                seen_job_ids.add(jid)
+                unique_results.append(r)
+
+            if len(unique_results) != len(vector_results):
+                logger.debug(f"Vector search returned {len(vector_results)} results; deduped to {len(unique_results)} unique job_ids")
+            else:
+                logger.debug(f"Vector search returned {len(vector_results)} unique results")
+
             match_results = []
-            for match in vector_results:
+            for match in unique_results:
                 try:
                     job_id = match["job_id"]
                     logger.debug(f"Fetching JD data for job_id={job_id}")
@@ -721,11 +1076,8 @@ class MatchingService(BaseAgent):
                         logger.warning(f"Could not fetch data for job_id {job_id}, skipping.")
                         continue
 
-                    semantic_score = 1 - match["distance"] # Cosine distance to similarity
+                    semantic_score = 1 - match["distance"]  # Cosine distance to similarity
                     logger.info(f"LLM match: candidate_id={candidate_id}, job_id={job_id}, semantic_score={semantic_score:.4f}")
-                    if self._check_for_existing_match(job_id, candidate_id):
-                        logger.debug(f"Match already exists for candidate {candidate_id} and job {job_id}. Skipping.")
-                        continue
 
                     logger.debug("Fetching full resume data for detailed match")
                     full_resume_data = self._fetch_resume_data(candidate_id)
@@ -735,9 +1087,8 @@ class MatchingService(BaseAgent):
 
                     try:
                         logger.debug("Calling _detailed_llm_match")
-                        match_details = self._detailed_llm_match(
-                            jd_data, full_resume_data)
-                        
+                        match_details = self._detailed_llm_match(jd_data, full_resume_data)
+
                         logger.debug("Storing match results in BigQuery")
                         match_id = self._store_match_results(job_id, candidate_id, semantic_score, match_details)
                         if match_id:

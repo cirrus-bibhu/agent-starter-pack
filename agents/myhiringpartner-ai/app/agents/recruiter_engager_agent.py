@@ -20,7 +20,12 @@ The user previously asked for the following information:
 - prime_vendor_email (string)
 - end_client_name (string)
 
+Additionally, extract a job title to help locate the job in our database:
+- job_title (string): infer the human-readable job title discussed (normalize, remove trailing IDs like "-MHP2526", strip Re:/Fwd: noise).
+
 Analyze the email body below and extract the values for these fields.
+
+Email Subject: {email_subject}
 
 **Recruiter's Reply:**
 ---
@@ -32,7 +37,8 @@ Analyze the email body below and extract the values for these fields.
 2.  Format the output as a single, clean JSON object.
 3.  If a value is not found, use `null`.
 4.  Ensure boolean values are `true` or `false`, not strings.
-5.  Do not include any text or explanations outside of the JSON object.
+5.  job_title should be a clean title without IDs/codes, in natural case (e.g., "Senior Desktop Support Technician").
+6.  Do not include any text or explanations outside of the JSON object.
 
 **JSON Output Example:**
 {{
@@ -40,7 +46,8 @@ Analyze the email body below and extract the values for these fields.
     "is_remote": false,
     "prime_vendor_name": "Tech Solutions Inc.",
     "prime_vendor_email": "contact@techsolutions.com",
-    "end_client_name": "Global Innovations Corp"
+    "end_client_name": "Global Innovations Corp",
+    "job_title": "Senior Desktop Support Technician"
 }}
 """
 
@@ -68,7 +75,7 @@ class RecruiterEngagerAgent(BaseAgent):
     
     def _extract_job_details(self, email_data: EmailData) -> Dict[str, Any]:
         try:
-            prompt = ADDITIONAL_INFO_EXTRACTION_PROMPT.format(email_body=email_data.body)
+            prompt = ADDITIONAL_INFO_EXTRACTION_PROMPT.format(email_body=email_data.body, email_subject=email_data.subject or "")
             response = self.model.generate_content(prompt)
 
             if not response.text:
@@ -199,7 +206,7 @@ class RecruiterEngagerAgent(BaseAgent):
         if not self.bq_client or not self.table_id:
             self.logger.error("BigQuery client not initialized. Cannot fetch job details.")
             return None
-
+        
         try:
             query = f"SELECT * FROM `{self.table_id}` WHERE job_id = @job_id"
             query_params = [
@@ -221,20 +228,97 @@ class RecruiterEngagerAgent(BaseAgent):
         except Exception as e:
             self.logger.error(f"Error fetching job details from BigQuery: {e}", exc_info=True)
             return None
+
+    # Removed separate _extract_job_title LLM call; title is now extracted in _extract_job_details
+
+    def _normalize_title(self, title: str) -> str:
+        """Normalize title for comparison (casefold, collapse whitespace)."""
+        t = re.sub(r"\s+", " ", title or "").strip()
+        return t.casefold()
+
+    def _get_job_id_by_title_bq(self, title: str) -> Optional[str]:
+        """Query BigQuery to find a job_id by job_title.
+        Tries exact (normalized) match first, then LIKE contains search. Returns the most recently updated if multiple.
+        """
+        if not self.bq_client or not self.table_id or not title:
+            return None
+        try:
+            # Attempt exact normalized match using LOWER and collapsing spaces
+            query_exact = f"""
+            SELECT job_id
+            FROM `{self.table_id}`
+            WHERE LOWER(REGEXP_REPLACE(job_title, r'\\s+', ' ')) = @norm
+            ORDER BY last_updated_timestamp DESC NULLS LAST
+            LIMIT 1"""
+            norm = self._normalize_title(title)
+            params = [bigquery.ScalarQueryParameter("norm", "STRING", norm)]
+            job_config = bigquery.QueryJobConfig(query_parameters=params)
+            rows = list(self.bq_client.query(query_exact, job_config=job_config).result())
+            if rows:
+                return rows[0]["job_id"]
+        except Exception as e:
+            self.logger.warning(f"Exact title match query failed, will try LIKE search: {e}")
+
+        try:
+            # Fallback to contains search
+            query_like = f"""
+            SELECT job_id
+            FROM `{self.table_id}`
+            WHERE LOWER(job_title) LIKE @like
+            ORDER BY last_updated_timestamp DESC NULLS LAST
+            LIMIT 1"""
+            like_val = f"%{(title or '').lower()}%"
+            params = [bigquery.ScalarQueryParameter("like", "STRING", like_val)]
+            job_config = bigquery.QueryJobConfig(query_parameters=params)
+            rows = list(self.bq_client.query(query_like, job_config=job_config).result())
+            if rows:
+                return rows[0]["job_id"]
+        except Exception as e:
+            self.logger.error(f"LIKE title match query failed: {e}", exc_info=True)
+
+        return None
     
-    def _extract_job_id(self, email_body: str) -> Optional[str]:
-        patterns = [
+    def _extract_job_id(self, email_data: EmailData) -> Optional[str]:
+        """Attempt to extract a job_id from the email body and subject.
+        
+        Heuristics applied in order:
+        1) Common explicit markers in body or subject like: "Job ID:", "Job #", "Reference No".
+        2) Generic token pattern like ABC1234 in body or subject.
+        3) Subject fallback: last hyphen-separated token if it looks like an ID.
+        """
+        body = email_data.body or ""
+        subject = email_data.subject or ""
+
+        explicit_patterns = [
             r"Job[\s-]?ID[\s:]+([A-Z0-9-]+)",
             r"Job[\s-]?#[\s:]+([A-Z0-9-]+)",
             r"Reference[\s-]?(?:No\.?|Number)[\s:]+([A-Z0-9-]+)",
-            r"\b(JB|JOB|REF)[\s-]?([A-Z0-9-]+)\b"
+            r"\b(?:JB|JOB|REF)[\s-]?([A-Z0-9-]+)\b",
         ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, email_body, re.IGNORECASE)
+
+        # 1) Try explicit patterns in body then subject
+        for text in (body, subject):
+            for pattern in explicit_patterns:
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    return match.group(1)
+
+        # 2) Try generic token like ABC1234 (2+ letters followed by 2+ digits) in body then subject
+        generic_pattern = r"\b([A-Z]{2,}\d{2,})\b"
+        for text in (body, subject):
+            match = re.search(generic_pattern, text, re.IGNORECASE)
             if match:
-                return match.group(1) if len(match.groups()) > 0 else match.group(0)
-        
+                return match.group(1).upper()
+
+        # 3) Subject fallback: last hyphen-separated token
+        if "-" in subject:
+            last_token = subject.split("-")[-1].strip()
+            if re.fullmatch(r"[A-Za-z0-9_-]{3,}", last_token):
+                # Prefer alnum uppercase, strip non-alnum dangles
+                cleaned = re.sub(r"[^A-Za-z0-9-]", "", last_token)
+                if re.fullmatch(r"[A-Za-z]{2,}\d{2,}", cleaned, re.IGNORECASE) or re.search(r"\d", cleaned):
+                    return cleaned.upper()
+
         return None
     
     def _is_complete_job_info(self, job_data: Dict[str, Any]) -> bool:
@@ -257,8 +341,8 @@ class RecruiterEngagerAgent(BaseAgent):
 
             self.logger.info(f"RecruiterEngagerAgent processing email: {email_data.subject}")
 
-            # Prioritize job_id from kwargs, otherwise extract from email
-            job_id = kwargs.get('job_id') or self._extract_job_id(email_data.body)
+            # Prefer job_id when explicitly provided; otherwise resolve after extraction via job_title
+            job_id = kwargs.get('job_id')
 
             job_details = self._extract_job_details(email_data)
             if not job_details:
@@ -266,6 +350,25 @@ class RecruiterEngagerAgent(BaseAgent):
                     "status": "error",
                     "message": "Could not extract job details from the email. Please provide the information in a clear format.",
                     "job_id": job_id
+                }
+
+            # Resolve internal numeric job_id from extracted job_title
+            if not job_id:
+                inferred_title = job_details.get('job_title')
+                if inferred_title:
+                    bq_job_id = self._get_job_id_by_title_bq(inferred_title)
+                    if bq_job_id:
+                        job_id = bq_job_id
+                        self.logger.info(f"Resolved job_id from title '{inferred_title}': {job_id}")
+                    else:
+                        self.logger.warning(f"Could not resolve job_id from inferred title: '{inferred_title}'")
+
+            # Still no job_id: cannot proceed with DB update
+            if not job_id:
+                return {
+                    "status": "error",
+                    "message": "Could not resolve job_id from the email (no Job ID found and title lookup failed).",
+                    "job_id": None
                 }
 
             # Ensure the extracted/passed job_id is in the details

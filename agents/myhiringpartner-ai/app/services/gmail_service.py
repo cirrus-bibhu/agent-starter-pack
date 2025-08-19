@@ -16,6 +16,7 @@ load_dotenv()
     
 CLIENT_ID = os.getenv("GMAIL_CLIENT_ID")
 CLIENT_SECRET = os.getenv("GMAIL_CLIENT_SECRET")
+QA_PROJECT_ID = "303735444828"  # QA project ID
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -41,14 +42,9 @@ class SecretManagerError(Exception):
 # --- Helper Functions ---
 
 def _get_project_id() -> str:
-    """Gets the Google Cloud Project ID from the environment or default auth."""
-    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
-    if not project_id:
-        try:
-            _, project_id = google.auth.default()
-        except google.auth.exceptions.DefaultCredentialsError:
-            raise EnvironmentError("GOOGLE_CLOUD_PROJECT env var not set or gcloud auth not configured.")
-    return project_id
+    """Gets the Google Cloud Project ID."""
+    # Always use QA project for secrets
+    return QA_PROJECT_ID
 
 def _sanitize_id_components(*args) -> tuple:
     """Sanitizes strings to be used in Secret Manager secret IDs."""

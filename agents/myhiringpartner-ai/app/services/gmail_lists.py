@@ -138,7 +138,7 @@ def main():
         return
 
     try:
-        email_address = 'bibhu@myhiringpartner.ai'
+        email_address = 'support@myhiringpartner.ai'
         
         service = create_gmail_service(email_address, CLIENT_ID, CLIENT_SECRET)
         

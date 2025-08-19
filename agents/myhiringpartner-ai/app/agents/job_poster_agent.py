@@ -412,15 +412,7 @@ class JobPosterAgent(BaseAgent):
                 
         except Exception as e:
             self.logger.error(f"Error scraping job details: {str(e)}")
-            self.logger.debug("Using fallback sample data for testing")
-            return {
-                "title": "Sample Job Title",
-                "companyName": "Sample Company",
-                "location": "Remote",
-                "description": "This is a sample job description for testing when scraping fails.",
-                "requirements": "Sample requirements: \n- Python development\n- API development\n- Cloud platforms",
-                "additionalInfo": "Additional testing information"
-            }
+            return None
 
     def _prepare_job_data(self, job_analysis: Dict[str, Any], job_url: str, email_data: EmailData) -> Dict[str, Any]:
         job_id = self._extract_linkedin_job_id(job_url)

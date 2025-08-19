@@ -1,6 +1,7 @@
 import os
 import json
 import uuid
+import asyncio
 from typing import Dict, Any
 from datetime import datetime
 import re
@@ -13,6 +14,7 @@ from ..tools.bq_schema_manager import ensure_table_exists
 from ..tools.file_processor import FileProcessor
 from datetime import datetime
 from jinja2 import Environment, FileSystemLoader
+from .matching_service import MatchingService
 
 RESUME_ANALYSIS_PROMPT = '''You are an expert resume analyzer. Your task is to extract detailed information from the provided resume text and format it into a single, valid JSON object that strictly adheres to the schema provided below.
 
@@ -20,10 +22,12 @@ RESUME_ANALYSIS_PROMPT = '''You are an expert resume analyzer. Your task is to e
 1.  **JSON ONLY:** Your entire response MUST be a single JSON object enclosed in a ```json markdown block. Do not include any text, comments, or formatting outside this block.
 2.  **SINGLE-LINE STRINGS:** All string values within the JSON must be on a single line. Do not use multi-line strings. This is critical for parsing.
 3.  **STRICT SCHEMA:** The JSON structure must exactly match the schema provided below. Do not add, remove, or rename any fields.
-4.  **SYNTAX:** Pay extremely close attention to JSON syntax. Ensure all strings are in double quotes, and there are no trailing commas.
-5.  **NULL VALUES:** If a value for a field cannot be found in the resume, use the JSON literal `null` (not the string "null" or an empty string).
-6.  **DATES:** Format all dates as "YYYY-MM-DD". If a full date is not available, do your best to infer it or use `null`.
-7.  **ESCAPING:** You MUST escape any backslashes (\\) or double quotes (") within string values by using a double backslash (\\\\) or (\"). This is especially important for the `resume_text` field.
+4.  **ARRAY FIELDS MUST BE JSON ARRAYS:** Any field that is defined as a repeated field in the schema (for example: technical_skills, previous_companies, domains_worked_in, certifications, and within experience -> technologies_used) MUST be a JSON array of strings. Do not return a single comma-separated string for these fields.
+5.  **EXPERIENCE.technologies_used:** For each experience entry, the `technologies_used` field MUST be an array of strings (e.g. ["Python", "SQL"]). If only a comma-separated string is available, split into an array. If none, return an empty array `[]` (not null or an empty string).
+6.  **SKILL_PROFICIENCY:** The skill_proficiency array must contain objects with `skill`, `level`, and `years_experience` as described in the schema.
+7.  **NULL VALUES:** If a value for a field cannot be found in the resume, use the JSON literal `null` for nullable scalar fields. For repeated fields use an empty array `[]` when nothing is present.
+8.  **DATES:** Format all dates as "YYYY-MM-DD". If a full date is not available, do your best to infer it or use `null`.
+9.  **ESCAPING:** You MUST escape any backslashes (\\) or double quotes (\") within string values by using a double backslash (\\\\) or (\"). This is especially important for the `resume_text` field.
 
 **BigQuery Schema to Follow:**
 ```json
@@ -254,12 +258,12 @@ class ResumeProcessorAgent(BaseAgent):
         try:
             # 1. Aggressively find the JSON block
             match = re.search(r'```(?:json)?\n?([\s\S]*?)\n?```', response)
-            if match:
+            if (match):
                 json_str = match.group(1).strip()
             else:
                 start_idx = response.find('{')
                 end_idx = response.rfind('}') + 1
-                if start_idx != -1 and end_idx != 0:
+                if (start_idx != -1 and end_idx != 0):
                     json_str = response[start_idx:end_idx].strip()
                 else:
                     self.logger.error("Could not extract JSON block from LLM response.")
@@ -291,6 +295,132 @@ class ResumeProcessorAgent(BaseAgent):
 
         pattern = r',(?=\\s*[}\\]])'
         return re.sub(pattern, '', json_str)
+
+    def _sanitize_resume_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Sanitize resume data to conform to BigQuery schema expectations.
+
+        - Ensure nested repeated fields such as experience[].technologies_used are lists of strings.
+        - For arrays of structs (experience, education, languages, skill_proficiency),
+          replace None or empty-string date fields with None to avoid invalid BQ dates.
+        - Preserve numeric fields as-is; if they are None, keep them None (nullable).
+        - Ensure lists are actually lists; if not, coerce to empty list.
+        """
+        def sanitize_list_of_dicts(items, parent_field=None):
+            if not isinstance(items, list):
+                return []
+            sanitized = []
+            numeric_fields = ['duration_months', 'years_of_experience']  # Add all numeric fields here
+            date_fields = ['start_date', 'end_date']
+
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+
+                new_item = {}
+                for k, v in item.items():
+                    # Ensure technologies_used (a repeated string field) is always a list
+                    if k == 'technologies_used':
+                        if v is None:
+                            new_item[k] = []
+                        elif isinstance(v, list):
+                            # normalize elements to strings and drop nulls
+                            new_item[k] = [str(x).strip() for x in v if x is not None and str(x).strip()]
+                        elif isinstance(v, str):
+                            # split on commas or semicolons and strip whitespace
+                            parts = [p.strip() for p in re.split(r'[;,]', v) if p.strip()]
+                            new_item[k] = parts if parts else []
+                        else:
+                            # fallback: coerce single value to string list
+                            try:
+                                new_item[k] = [str(v)]
+                            except Exception:
+                                new_item[k] = []
+                    # Normalize date fields: convert empty strings to None, validate YYYY-MM-DD
+                    elif k in date_fields:
+                        if v is None or (isinstance(v, str) and not v.strip()):
+                            new_item[k] = None
+                        else:
+                            if isinstance(v, str) and re.match(r'^\d{4}-\d{2}-\d{2}$', v.strip()):
+                                new_item[k] = v.strip()
+                            else:
+                                if isinstance(v, str) and re.match(r'^\d{4}$', v.strip()):
+                                    new_item[k] = f"{v.strip()}-01-01"
+                                else:
+                                    new_item[k] = None
+                    # Handle numeric fields that might be empty strings or invalid
+                    elif k in numeric_fields:
+                        if v == '' or v is None:
+                            new_item[k] = None
+                        else:
+                            try:
+                                new_item[k] = int(v) if str(v).strip().isdigit() else v
+                            except (ValueError, TypeError, AttributeError):
+                                new_item[k] = None
+                    # Preserve nested lists/dicts as-is where appropriate
+                    elif isinstance(v, list):
+                        # normalize list elements to strings where possible
+                        new_item[k] = [x if not isinstance(x, dict) else x for x in v]
+                    elif isinstance(v, (int, float, bool)):
+                        new_item[k] = v
+                    elif v is None:
+                        # For string-typed fields set None -> None (leave as NULL)
+                        new_item[k] = None
+                    else:
+                        new_item[k] = str(v)
+                sanitized.append(new_item)
+            return sanitized
+
+        sanitized_data = dict(data or {})
+
+        # Known RECORD arrays
+        for field in ["experience", "education", "languages", "skill_proficiency"]:
+            sanitized_data[field] = sanitize_list_of_dicts(sanitized_data.get(field, []), parent_field=field)
+
+        # For education, ensure graduation_year is numeric or None
+        if isinstance(sanitized_data.get('education'), list):
+            for edu in sanitized_data['education']:
+                if isinstance(edu, dict):
+                    gy = edu.get('graduation_year')
+                    if gy is None or (isinstance(gy, str) and not gy.strip()):
+                        edu['graduation_year'] = None
+                    else:
+                        try:
+                            if isinstance(gy, str) and re.match(r'^\d{4}$', gy.strip()):
+                                edu['graduation_year'] = int(gy.strip())
+                        except Exception:
+                            edu['graduation_year'] = None
+
+        # Known string arrays: technical_skills, soft_skills, certifications, previous_companies, domains_worked_in
+        for field in [
+            "technical_skills",
+            "soft_skills",
+            "certifications",
+            "previous_companies",
+            "domains_worked_in",
+        ]:
+            val = sanitized_data.get(field)
+            if isinstance(val, list):
+                sanitized_data[field] = [str(x) for x in val if x is not None]
+            elif isinstance(val, str):
+                parts = [p.strip() for p in re.split(r'[;,]', val) if p.strip()]
+                sanitized_data[field] = parts
+            elif val is None:
+                sanitized_data[field] = []
+
+        # Basic top-level normalizations (safe defaults)
+        for sfield in [
+            "candidate_name",
+            "candidate_email",
+            "candidate_phone",
+            "candidate_location",
+            "linkedin_url",
+            "resume_summary",
+            "visa_status",
+        ]:
+            if sanitized_data.get(sfield) is None:
+                sanitized_data[sfield] = None  # keep as NULL at top-level (nullable)
+
+        return sanitized_data
 
     def _upload_to_gcs(self, file_path: str, content: bytes = None) -> str:
         """Uploads content to Google Cloud Storage and returns the URI."""
@@ -344,28 +474,71 @@ class ResumeProcessorAgent(BaseAgent):
 
     def save_resume_to_bq(self, resume_data: Dict[str, Any], embeddings: list, storage_uri: str) -> bool:
         """Saves the structured resume data and embeddings to BigQuery."""
-        if not self.bq_client or not self.table_id:
+        # Ensure BigQuery client/table initialized on-demand
+        if not self.bq_client:
+            self.logger.warning("BigQuery client not initialized. Attempting to re-initialize...")
+            self.bq_client = self._get_bigquery_client()
+            if not self.bq_client:
+                self.logger.error("BigQuery client could not be initialized.")
+                return False
+        if not self.table_id:
+            self.table_id = f"{self.bq_client.project}.{config.bq_dataset}.resumes"
+        try:
+            ensure_table_exists(self.bq_client, self.table_id)
+        except Exception as e:
+            self.logger.error(f"Failed to verify or create BigQuery table '{self.table_id}': {e}", exc_info=True)
             return False
 
         try:
+            sanitized = self._sanitize_resume_data(resume_data)
             row = {
-                **resume_data,
+                **sanitized,
                 "embeddings": embeddings,
                 "storage_uri": storage_uri,
                 "created_at": datetime.utcnow().isoformat(),
                 "updated_at": datetime.utcnow().isoformat()
             }
 
+            # Debug: log the sanitized row at DEBUG level to inspect arrays/structures
+            try:
+                self.logger.debug(f"Sanitized row payload for BQ insert: {json.dumps(row, default=str)[:2000]}")
+            except Exception:
+                self.logger.debug("Sanitized row payload could not be JSON-serialized for debug logging.")
+
             errors = self.bq_client.insert_rows_json(self.table_id, [row])
             if not errors:
                 self.logger.info(f"Successfully inserted resume for {resume_data.get('candidate_name')} into BigQuery.")
                 return True
             else:
+                # Log the full sanitized row when insertion fails to aid debugging
                 self.logger.error(f"BigQuery insertion errors: {errors}")
+                try:
+                    self.logger.error(f"Full sanitized row causing error: {json.dumps(row, default=str)}")
+                except Exception:
+                    self.logger.error("Failed to serialize sanitized row for logging.")
                 return False
         except Exception as e:
             self.logger.error(f"Failed to save resume to BigQuery: {e}", exc_info=True)
             return False
+
+    def _extract_job_title_from_subject(self, subject: str) -> str:
+        """Extract job title from subjects like:
+        Returns the job title (e.g. 'Data Engineer') or None if not found.
+        """
+        if not subject or not isinstance(subject, str):
+            return None
+        try:
+            # Try to capture text after 'New application:' until '-MHP-' or ' from '
+            m = re.search(r'New application:\s*(?P<title>.*?)(?:\s*-MHP-\d+|\s+from\b|$)', subject, re.IGNORECASE)
+            if m:
+                return m.group('title').strip()
+            # Fallback: capture between colon and 'from'
+            m2 = re.search(r':\s*(?P<title>.*?)\s+from\b', subject, re.IGNORECASE)
+            if m2:
+                return m2.group('title').strip()
+            return None
+        except Exception:
+            return None
 
     def run(self, email_data: EmailData) -> Dict[str, Any]:
         """Main method to process an email with a resume attachment."""
@@ -425,46 +598,72 @@ class ResumeProcessorAgent(BaseAgent):
             if not storage_uri:
                 return {"status": "error", "message": "Failed to upload resume to storage"}
 
-            resume_text = FileProcessor.extract_text_from_file(temp_resume_path)
+            self.logger.info("Extracting text from resume file...")
+            # Use asyncio to run the async method
+            resume_text = asyncio.run(FileProcessor.extract_text_from_file(temp_resume_path))
+            self.logger.info(f"Extracted resume text length: {len(resume_text) if resume_text else 0}")
             if not resume_text:
                 return {"status": "error", "message": "Could not extract text from PDF."}
 
             candidate_id = str(uuid.uuid4())
             
+            self.logger.info("Analyzing resume with LLM...")
             analysis = self.analyze_resume(resume_text, candidate_id)
             if not analysis:
                 return {"status": "error", "message": "Failed to analyze resume"}
 
+            self.logger.info("Generating embeddings for resume text...")
             embeddings = self._generate_embeddings(resume_text)
             
+            self.logger.info("Inserting resume record into BigQuery...")
             if self.save_resume_to_bq(analysis, embeddings, storage_uri):
-                missing_info = self._check_essential_information(analysis)
-                if missing_info:
-                    email_to_send = self._generate_candidate_email(missing_info, analysis)
-                    if email_to_send.recipient:
-                        self.send_email(to=email_to_send.recipient, subject=email_to_send.subject, body=email_to_send.body)
-                    return {
-                        "status": "success",
-                        "message": "Resume processed, but essential information is missing. An email has been sent to the recruiter.",
-                        "candidate_id": candidate_id,
-                        "details": {
-                            "candidate_name": analysis.get("candidate_name"),
-                            "storage_uri": storage_uri,
-                            "missing_info": missing_info
-                        }
+                # Persisted successfully. Do not perform essential-info follow-up here.
+                # The CoordinatorAgent will run matching (workflow2) and decide whether
+                # to trigger candidate follow-up based on the screening decision.
+                # --- New: if this resume came as a job application, attempt to resolve
+                # the job title in the email subject to a job_id and run matching
+                try:
+                    job_title = None
+                    if getattr(email_data, 'subject', None):
+                        job_title = self._extract_job_title_from_subject(email_data.subject)
+                    if job_title:
+                        self.logger.info(f"Detected job application for title: {job_title}. Looking up job_id...")
+                        try:
+                            ms = MatchingService()
+                            resolved_job_id = ms._find_job_id_by_title(job_title)
+                            if resolved_job_id:
+                                self.logger.info(f"Resolved job_id={resolved_job_id} for title '{job_title}'. Running matching workflow...")
+                                try:
+                                    match_results = ms.workflow2_resume_to_jds(candidate_id=candidate_id, job_id=resolved_job_id)
+                                    self.logger.info(f"Matching completed for candidate {candidate_id} vs job {resolved_job_id}")
+                                except Exception as me:
+                                    self.logger.error(f"Error running matching workflow for job_id={resolved_job_id}: {me}", exc_info=True)
+                                    match_results = {"status": "error", "message": str(me)}
+                            else:
+                                self.logger.info(f"No job found matching title '{job_title}' in job_details table.")
+                                match_results = None
+                        except Exception as e:
+                            self.logger.error(f"Failed to lookup job_id for title '{job_title}': {e}", exc_info=True)
+                            match_results = None
+                    else:
+                        match_results = None
+                except Exception:
+                    match_results = None
+
+                response = {
+                    "status": "success",
+                    "message": "Resume processed and saved to BigQuery.",
+                    "candidate_id": candidate_id,
+                    "details": {
+                        "candidate_name": analysis.get('candidate_name'),
+                        "storage_uri": storage_uri
                     }
-                else:
-                    return {
-                        "status": "success",
-                        "message": "Resume processed and saved to BigQuery.",
-                        "candidate_id": candidate_id,
-                        "details": {
-                            "candidate_name": analysis.get("candidate_name"),
-                            "storage_uri": storage_uri
-                        }
-                    }
-            else:
-                return {"status": "error", "message": "Failed to save resume data"}
+                }
+
+                if match_results is not None:
+                    response['matching_results'] = match_results
+
+                return response
 
         except Exception as e:
             self.logger.error(f"Error processing resume email: {e}", exc_info=True)

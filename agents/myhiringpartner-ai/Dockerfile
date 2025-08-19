@@ -14,6 +14,13 @@
 
 FROM python:3.11-slim
 
+RUN apt-get update && apt-get install -y \
+    tesseract-ocr \
+    poppler-utils \
+    antiword \
+    --no-install-recommends && \
+    rm -rf /var/lib/apt/lists/*
+
 RUN pip install --no-cache-dir uv==0.6.12
 
 WORKDIR /code

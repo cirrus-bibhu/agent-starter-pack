@@ -12,12 +12,6 @@ load_dotenv()
 app = FastAPI()
 coordinator = CoordinatorAgent()
 
-# Pub/Sub subscriber
-subscriber = pubsub_v1.SubscriberClient()
-subscription_path = subscriber.subscription_path(
-    "saas-agent-d", "hiring-emails-subscription"
-)
-
 @app.post("/process-pubsub-message")
 async def process_pubsub_message(message_data: dict, background_tasks: BackgroundTasks):
     """Process Pub/Sub message containing email data"""

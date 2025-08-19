@@ -417,19 +417,89 @@ class CoordinatorAgent(BaseAgent):
             }
 
     def _extract_job_id_from_subject(self, subject: str) -> Optional[str]:
-        """Extract job ID from email subject."""
-        # Look for patterns like "Position 12345" or "JobID: 12345" etc.
+        """Extract and validate a job identifier from an email subject.
+
+        Strategy (in order):
+        1) Look for explicit vendor/internal codes like 'MHP-2528' or 'MHP2528' and normalize to 'MHP-2528'.
+        2) Look for LinkedIn job URLs and extract the numeric job id from the URL.
+        3) Look for labeled tokens like 'Job ID: XYZ' (alphanumeric allowed).
+        4) Do NOT return a generic 4+-digit match. Only return a value if validation
+           against the job_details table succeeds (using MatchingService._fetch_jd_data).
+
+        Returns the validated job_id string as stored in job_details, or None when
+        no validated id can be found.
+        """
+        if not subject or not isinstance(subject, str):
+            return None
+
         import re
+        try:
+            subj = subject.strip()
+
+            # 1) Vendor/internal code, e.g. MHP-2528 or MHP2528 (capture prefix+digits)
+            m = re.search(r"\b([A-Za-z]{2,}-?\d{2,})\b", subj, re.IGNORECASE)
+            if m:
+                raw = m.group(1)
+                # normalize to PREFIX-<digits>
+                norm = re.sub(r"([A-Za-z]+)[-_]?(\d+)", lambda mo: f"{mo.group(1).upper()}-{mo.group(2)}", raw)
+                # Validate normalized token against job_details
+                try:
+                    jd = self.matching_service._fetch_jd_data(norm)
+                    if jd:
+                        return norm
+                except Exception:
+                    # ignore validation errors and continue
+                    pass
+                # Try plain digits fallback only for validation (in case job_id stored as just digits)
+                digits_m = re.search(r"(\d+)$", norm)
+                if digits_m:
+                    digits = digits_m.group(1)
+                    try:
+                        jd2 = self.matching_service._fetch_jd_data(digits)
+                        if jd2:
+                            return digits
+                    except Exception:
+                        pass
+
+            # 2) LinkedIn job URL pattern
+            m = re.search(r"linkedin\.com/.+?/jobs/view/(\d+)", subj, re.IGNORECASE)
+            if m:
+                linkedin_id = m.group(1)
+                try:
+                    jd = self.matching_service._fetch_jd_data(linkedin_id)
+                    if jd:
+                        return linkedin_id
+                except Exception:
+                    pass
+
+            # 3) Labeled Job ID like 'Job ID: ABC-123' or 'Job-ID 1234'
+            m = re.search(r"Job[\s-]?ID[:\s]*([A-Za-z0-9\-_.]+)", subj, re.IGNORECASE)
+            if m:
+                token = m.group(1).strip()
+                try:
+                    jd = self.matching_service._fetch_jd_data(token)
+                    if jd:
+                        return token
+                except Exception:
+                    pass
+
+            # If nothing validated, return None. Do NOT return a blind numeric match.
+            return None
+        except Exception:
+            return None
+
+    def _extract_job_title_from_subject(self, subject: str) -> Optional[str]:
+        """Extract job title from email subject."""
+        # Look for patterns like "Job Title: Software Engineer" or "Position: Data Scientist"
         patterns = [
-            r'Position\s+(\d+)',  # Matches "Position 12345"
-            r'Job[\s-]?ID[\s:]+(\d+)',  # Matches "Job ID: 12345" or "Job-ID 12345"
-            r'\b(\d{4,})\b'  # Matches any 4+ digit number
+            r'Job Title[:\s]+(.+)',  # Matches "Job Title: Software Engineer"
+            r'Position[:\s]+(.+)',  # Matches "Position: Data Scientist"
         ]
         
         for pattern in patterns:
             match = re.search(pattern, subject)
             if match:
-                return match.group(1)
+                return match.group(1).strip()
         return None
 
     def route_to_job_closing(self, email_content: str, confidence: float = 0.8):
@@ -481,7 +551,7 @@ class CoordinatorAgent(BaseAgent):
                         "processing_time": f"{duration:.2f}s"
                     }
                 }
-                
+
                 # Extract candidate_id and potential job_id from subject
                 candidate_id = result.get('candidate_id')
                 if not candidate_id and isinstance(result.get('result'), dict):
@@ -490,65 +560,102 @@ class CoordinatorAgent(BaseAgent):
                 if hasattr(email_data, 'subject'):
                     job_id = self._extract_job_id_from_subject(email_data.subject)
 
-                if candidate_id:
-                    # Fetch latest resume row and check for essential fields
-                    resume_row = None
+                try:
+                    if job_id and re.search(r"[A-Za-z]", str(job_id)):
+                        job_title_candidate = self._extract_job_title_from_subject(email_data.subject)
+                        if not job_title_candidate:
+                            m = re.search(r"new application[:\s-]*([^\-]+)(?:\s+-|\s+from\b|$)", email_data.subject, re.IGNORECASE)
+                            if m:
+                                job_title_candidate = m.group(1).strip()
+
+                        if job_title_candidate:
+                            try:
+                                resolved_job_id = self.matching_service._find_job_id_by_title(job_title_candidate)
+                                if resolved_job_id:
+                                    self.logger.info(f"Resolved vendor token '{job_id}' to stored job_id={resolved_job_id} using title '{job_title_candidate}'")
+                                    job_id = resolved_job_id
+                            except Exception as e:
+                                self.logger.debug(f"Error resolving job id from title '{job_title_candidate}': {e}")
+                except Exception:
+                    pass
+
+                # If no explicit job_id found earlier, try to extract a job title from the subject
+                # and resolve it to a job_id using MatchingService (existing behavior)
+                if not job_id and hasattr(email_data, 'subject'):
                     try:
-                        resume_row = self.matching_service._fetch_resume_data(candidate_id)
-                    except Exception as e:
-                        self.logger.error(f"Failed to fetch resume data for candidate_id={candidate_id}: {e}")
+                        job_title_candidate = self._extract_job_title_from_subject(email_data.subject)
+                        if job_title_candidate:
+                            resolved_job_id = None
+                            try:
+                                resolved_job_id = self.matching_service._find_job_id_by_title(job_title_candidate)
+                            except Exception as e:
+                                self.logger.debug(f"Error resolving job id from title '{job_title_candidate}': {e}")
+                            if resolved_job_id:
+                                job_id = resolved_job_id
+                                self.logger.info(f"Resolved job_id={job_id} from title '{job_title_candidate}'")
+                    except Exception:
+                        pass
 
-                    missing_fields = []
-                    if resume_row:
-                        # Essentials based on RESUMES_SCHEMA: candidate_location, linkedin_url (+ optionally phone/email)
-                        if not resume_row.get('candidate_location'):
-                            missing_fields.append('location')
-                        if not resume_row.get('linkedin_url'):
-                            missing_fields.append('linkedin profile URL')
-                        # Optional basics that help engagement
-                        if not resume_row.get('candidate_email') and not getattr(email_data, 'sender', None):
-                            missing_fields.append('email address')
-
-                    if resume_row and missing_fields:
-                        # Generate and save follow-up draft to candidate, then skip matching for now
-                        try:
-                            subject, body_html = self._generate_candidate_followup_email(
-                                candidate_name=resume_row.get('candidate_name') or 'there',
-                                missing_fields=missing_fields,
-                                job_id=job_id
-                            )
-                            to_email = getattr(email_data, 'sender', None) or resume_row.get('candidate_email')
-                            if not to_email:
-                                raise Exception('Candidate email not available to send follow-up draft')
-                            from_email = "bibhu@myhiringpartner.ai"
-                            # Reuse JobPosterAgent draft utility
-                            draft_helper = JobPosterAgent()
-                            draft_id = draft_helper._save_email_as_draft(from_email, to_email, subject, body_html)
-                            response['followup_draft'] = {
-                                'draft_id': draft_id,
-                                'to': to_email,
-                                'subject': subject,
-                                'missing_fields': missing_fields
-                            }
-                            response['matching_result'] = {
-                                'status': 'skipped',
-                                'message': 'Essential candidate information missing; follow-up draft created.'
-                            }
-                            self.logger.info(f"Created candidate follow-up draft {draft_id} for missing: {missing_fields}")
-                            return response
-                        except Exception as e:
-                            self.logger.error(f"Failed to create candidate follow-up draft: {e}", exc_info=True)
-                            # Fall through to matching even if draft fails, to avoid blocking the flow entirely
-
-                    # If essentials present (or resume_row missing), proceed with matching workflow2
+                if candidate_id:
                     try:
                         self.logger.info(
                             f"Calling workflow2_resume_to_jds for candidate_id={candidate_id}" +
                             (f" (applied to job_id={job_id})" if job_id else "")
                         )
-                        match_result = self.matching_service.workflow2_resume_to_jds(candidate_id)
+                        match_result = self.matching_service.workflow2_resume_to_jds(candidate_id, job_id=job_id)
                         response['matching_result'] = match_result
                         self.logger.info("workflow2_resume_to_jds completed")
+
+                        # After matching completes, check resume for missing candidate details and create follow-up draft if needed
+                        try:
+                            resume_full = self.matching_service._fetch_resume_data(candidate_id)
+                            if resume_full:
+                                missing_items = []
+                                if not resume_full.get('linkedin_url'):
+                                    missing_items.append('LinkedIn Profile URL')
+                                if not resume_full.get('candidate_location'):
+                                    missing_items.append('Current Location')
+
+                                # Only create follow-up drafts when at least one match has a screening status
+                                # that indicates we should proceed: Proceed Ahead / Move/Moving Forward / Requires Clarification
+                                allowed_statuses = {"proceed ahead", "move forward", "moving forward", "requires clarification"}
+                                has_valid_match = False
+                                for m in (match_result or {}).get('matches', []):
+                                    try:
+                                        status = (m.get('match_details', {}) or {}).get('screening_decision', {}) or {}
+                                        status_str = status.get('status') if isinstance(status, dict) else ''
+                                        status_val = (status_str or '').strip().lower()
+                                        if status_val in allowed_statuses:
+                                            has_valid_match = True
+                                            break
+                                    except Exception:
+                                        continue
+
+                                if missing_items and has_valid_match:
+                                    subject, body_html = self._generate_candidate_followup_email(
+                                        candidate_name=resume_full.get('candidate_name', 'there'),
+                                        missing_fields=list(missing_items),
+                                        job_id=job_id
+                                    )
+                                    try:
+                                        draft_helper = JobPosterAgent()
+                                        to_email = resume_full.get('candidate_email') or email_data.sender
+                                        from_email = 'support@myhiringpartner.ai'
+                                        if to_email:
+                                            draft_id = draft_helper._save_email_as_draft(from_email, to_email, subject, body_html)
+                                            # annotate the matching result with follow-up metadata
+                                            if isinstance(response.get('matching_result'), dict):
+                                                response['matching_result']['followup_created'] = True
+                                                response['matching_result']['followup_draft_id'] = draft_id
+                                            self.logger.info(f"Created follow-up draft {draft_id} for candidate {candidate_id}")
+                                        else:
+                                            self.logger.warning(f"No recipient email available to create follow-up draft for candidate {candidate_id}")
+                                    except Exception as de:
+                                        self.logger.error(f"Failed to save follow-up draft: {de}", exc_info=True)
+                                else:
+                                    self.logger.info("No matches with screening status requiring follow-up or no missing candidate fields; not creating follow-up draft")
+                        except Exception as e:
+                            self.logger.error(f"Error checking resume for follow-up: {e}", exc_info=True)
                     except Exception as e:
                         self.logger.error(f"Error calling matching service: {str(e)}", exc_info=True)
                         response['matching_result'] = {
@@ -566,8 +673,9 @@ class CoordinatorAgent(BaseAgent):
                         'candidate_id': candidate_id,
                         'job_id': job_id
                     }
+
+                    return response
                 
-                return response
             else:
                 self.logger.error(f"Resume processing failed: {result.get('message')}")
             
@@ -665,8 +773,72 @@ MyHiringPartner.ai"""
             classification = self._classify_email_type(email_data)
             classification_time = time.time() - start_time
             self.logger.debug(f"Classification completed in {classification_time:.2f}s")
-            
-            if classification == EmailType.JOB_POSTING:
+
+            if classification == EmailType.RESUME_APPLICATION:
+                # First process the resume
+                result = self.route_to_resume_processor(email_json, confidence=0.9)
+                if result.get("status") == "success" and result.get("details", {}).get("candidate_id"):
+                    candidate_id = result["details"]["candidate_id"]
+                    
+                    # Get complete resume data
+                    resume_data = self.matching_service._fetch_resume_data(candidate_id)
+                    if not resume_data:
+                        self.logger.error(f"Could not fetch resume data for candidate_id={candidate_id}")
+                        return result
+
+                    # Run matching service
+                    self.logger.info(f"Resume processing successful. Triggering matching service for candidate_id: {candidate_id}")
+                    try:
+                        match_results = self.matching_service.workflow2_resume_to_jds(candidate_id=candidate_id)
+                        self.logger.info(f"Matching service completed for candidate_id: {candidate_id}")
+                        
+                        # Check for matches that need follow-up
+                        matches = match_results.get("matches", [])
+                        for match in matches:
+                            match_details = match.get("match_details", {})
+                            status = match_details.get("screening_decision", {}).get("status")
+                            
+                            # Only proceed when screening status indicates follow-up is appropriate
+                            allowed_statuses = {"proceed ahead", "move forward", "moving forward", "requires clarification"}
+                            status_norm = (status or "").strip().lower()
+                            if status_norm in allowed_statuses:
+                                # Check for missing essential fields
+                                missing_info = {}
+                                if not resume_data.get("linkedin_url"):
+                                    missing_info["linkedin_url"] = "LinkedIn Profile URL"
+                                if not resume_data.get("candidate_location"):
+                                    missing_info["location"] = "Current Location"
+                                
+                                if missing_info:
+                                    # Generate and send follow-up email
+                                    subject, body_html = self._generate_candidate_followup_email(
+                                        candidate_name=resume_data.get("candidate_name", "there"),
+                                        missing_fields=list(missing_info.values()),
+                                        job_id=match.get("job_id")
+                                    )
+                                    
+                                    # Use JobPosterAgent's draft utility
+                                    draft_helper = JobPosterAgent()
+                                    to_email = resume_data.get("candidate_email") or email_data.sender
+                                    from_email = "support@myhiringpartner.ai"
+                                    
+                                    if to_email:
+                                        draft_id = draft_helper._save_email_as_draft(from_email, to_email, subject, body_html)
+                                        self.logger.info(f"Created follow-up draft {draft_id} for candidate {candidate_id}")
+                                        match_results["followup_created"] = True
+                                        match_results["followup_draft_id"] = draft_id
+                                    else:
+                                        self.logger.error("No email address available for follow-up")
+                        
+                        result["matching_results"] = match_results
+                        
+                    except Exception as e:
+                        self.logger.error(f"Matching service failed for candidate_id {candidate_id}: {e}", exc_info=True)
+                        result["matching_results"] = {"status": "error", "message": str(e)}
+                
+                return self._format_response("resume_processor", result, 0.9)
+
+            elif classification == EmailType.JOB_POSTING:
                 result = self.route_to_job_poster(email_json, confidence=0.9)
                 if result.get("status") == "success" and result.get("details", {}).get("job_id"):
                     job_id = result["details"]["job_id"]
@@ -680,19 +852,6 @@ MyHiringPartner.ai"""
                         result['matching_results'] = {"status": "error", "message": str(e)}
                 return result
 
-            elif classification == EmailType.RESUME_APPLICATION:
-                result = self.route_to_resume_processor(email_json, confidence=0.9)
-                if result.get("status") == "success" and result.get("details", {}).get("candidate_id"):
-                    candidate_id = result["details"]["candidate_id"]
-                    self.logger.info(f"Resume processing successful. Triggering matching service for candidate_id: {candidate_id}")
-                    try:
-                        match_results = self.matching_service.workflow2_resume_to_jds(candidate_id=candidate_id)
-                        self.logger.info(f"Matching service completed for candidate_id: {candidate_id}. Results: {match_results}")
-                        result['matching_results'] = match_results
-                    except Exception as e:
-                        self.logger.error(f"Matching service failed for candidate_id {candidate_id}: {e}", exc_info=True)
-                        result['matching_results'] = {"status": "error", "message": str(e)}
-                return result
             elif classification == EmailType.RECRUITER_JD_INFO_REPLIED:
                 self.logger.info("Routing to recruiter engager agent...")
                 recruiter_engager_result = self.recruiter_engager_agent.run(email_data)
@@ -708,10 +867,9 @@ MyHiringPartner.ai"""
 
                         try:
                             self.logger.info(f"Starting embeddings workflow for job_id={job_id} (limit=5)")
-                            # Reduce limit to speed up end-to-end latency during reply-triggered matching.
                             embeddings_match_result = self.matching_service.workflow1_jd_to_resumes(job_id=job_id, limit=5)
                             self.logger.info(f"Embeddings workflow completed for job_id={job_id}: processed={embeddings_match_result.get('total_candidates_processed')} matched={embeddings_match_result.get('candidates_matched')}")
-                            # If embeddings search produced no matches, fall back to ex-consultant heuristic search.
+                            
                             if not embeddings_match_result.get("matches"):
                                 self.logger.info(f"No matches from embeddings workflow for job_id={job_id}. Falling back to ex-consultant matching...")
                                 ex_consultant_result = self.ex_consultant_agent.run(job_data=job_data)
@@ -732,11 +890,9 @@ MyHiringPartner.ai"""
                                                 "key_strengths": [],
                                                 "gaps_and_concerns": []
                                             }
-                                            self.matching_service._store_match_result(job_id, candidate_id, consultant.get("match_score", 0), match_details)
+                                            self.matching_service._store_match_results(job_id, candidate_id, consultant.get("match_score", 0), match_details)
                                     except Exception as ie:
                                         self.logger.error(f"Fallback ex-consultant match insert failed for job_id={job_id}, candidate_id={candidate_id}: {ie}")
-                                return self._format_response("ex_consultant_search_completed", ex_consultant_result, 0.9)
-                            # workflow1_jd_to_resumes already persists each match into BigQuery (matches table).
                             return self._format_response("embeddings_matching_completed", embeddings_match_result, 0.9)
                         except Exception as e:
                             self.logger.error(f"Embeddings matching workflow failed for job_id={job_id}: {e}")
@@ -769,6 +925,7 @@ MyHiringPartner.ai"""
                 else:
                     self.logger.error("Recruiter engager agent failed.")
                     return self._format_response("recruiter_jd_info_replied", recruiter_engager_result, 0.9)
+            
             elif classification == EmailType.CANDIDATE_MOVE_FORWAD_REPLY:
                 self.logger.info("Routing to verification manager agent...")
                 result = self.route_to_verification_manager(email_data)
@@ -776,6 +933,7 @@ MyHiringPartner.ai"""
                     return self._format_response("candidate_move_forwad_reply", result, 0.9)
                 else:
                     return result
+            
             elif classification == EmailType.JOB_CLOSING:
                 self.logger.info("Routing to job closing agent...")
                 job_id = self._extract_job_id_from_subject(email_data.subject)
