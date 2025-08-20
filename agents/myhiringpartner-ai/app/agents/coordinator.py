@@ -15,6 +15,7 @@ from app.agents.recruiter_engager_agent import RecruiterEngagerAgent
 from app.agents.ex_consultant_agent import ExConsultantAgent
 from app.agents.verification_manager import VerificationManagerAgent
 from app.agents.job_closing_agent import JobClosingAgent
+from app.services.gmail_sender import GmailSender
 
 ROUTING_PROMPT_TEMPLATE = """Analyze the following email and call the appropriate function to process it.
 
@@ -638,22 +639,25 @@ class CoordinatorAgent(BaseAgent):
                                         job_id=job_id
                                     )
                                     try:
-                                        draft_helper = JobPosterAgent()
                                         to_email = resume_full.get('candidate_email') or email_data.sender
                                         from_email = 'support@myhiringpartner.ai'
                                         if to_email:
-                                            draft_id = draft_helper._save_email_as_draft(from_email, to_email, subject, body_html)
-                                            # annotate the matching result with follow-up metadata
+                                            gmail_sender = GmailSender()
+                                            gmail_sender.send_email(
+                                                sender=from_email,
+                                                recipient=to_email,
+                                                subject=subject,
+                                                body=body_html
+                                            )
                                             if isinstance(response.get('matching_result'), dict):
-                                                response['matching_result']['followup_created'] = True
-                                                response['matching_result']['followup_draft_id'] = draft_id
-                                            self.logger.info(f"Created follow-up draft {draft_id} for candidate {candidate_id}")
+                                                response['matching_result']['followup_sent'] = True
+                                                self.logger.info(f"Follow-up email sent to {to_email} for candidate {candidate_id}")
                                         else:
-                                            self.logger.warning(f"No recipient email available to create follow-up draft for candidate {candidate_id}")
+                                            self.logger.warning(f"No recipient email available to send follow-up email for candidate {candidate_id}")
                                     except Exception as de:
-                                        self.logger.error(f"Failed to save follow-up draft: {de}", exc_info=True)
+                                        self.logger.error(f"Failed to send follow-up email: {de}", exc_info=True)
                                 else:
-                                    self.logger.info("No matches with screening status requiring follow-up or no missing candidate fields; not creating follow-up draft")
+                                    self.logger.info("No matches with screening status requiring follow-up or no missing candidate fields; not sending follow-up email")
                         except Exception as e:
                             self.logger.error(f"Error checking resume for follow-up: {e}", exc_info=True)
                     except Exception as e:
@@ -700,7 +704,7 @@ class CoordinatorAgent(BaseAgent):
         
         email_template = f"""Subject: Regarding Job Posting: {job_analysis.get('job_title')}
 
-Hi Bibhu,
+Hi,
 
 Thank you for sharing the job opportunity for the {job_analysis.get('job_title')} position at {job_analysis.get('end_client_name')}.
 

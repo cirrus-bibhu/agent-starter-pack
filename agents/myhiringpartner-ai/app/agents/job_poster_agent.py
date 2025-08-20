@@ -935,7 +935,7 @@ Additional Information:
                 subject, body_html, _ = email_generation_result # Original to_email is ignored
 
                 # The 'from_email' is the agent's address, the 'to_email' is the original sender.
-                from_email = "bibhu@myhiringpartner.ai"
+                from_email = "support@myhiringpartner.ai"
                 to_email = email_data.sender
 
                 if not to_email:
