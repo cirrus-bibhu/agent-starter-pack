@@ -397,6 +397,37 @@ class JobPosterAgent(BaseAgent):
         self.logger.warning(f"Could not extract job ID from URL: {url}")
         return None
 
+    def _extract_internal_job_id(self, subject: str) -> str:
+        """Extract an internal/vendor job ID from the email subject.
+
+        Rules:
+        - Prefer internal Job_Id like 'MHP-2529' or 'MHP2529' and normalize to 'MHP-2529'.
+        - Return None if not found.
+        """
+        try:
+            if not subject or not isinstance(subject, str):
+                return None
+            subj = subject.strip()
+            subj = re.sub(r"[\[\]\(\)]", " ", subj)
+
+            # Internal code, e.g., MHP-2528 or MHP2528 or MHP 2528 or MHP_2528
+            m = re.search(r"\b([A-Za-z]{2,})[-_ ]?(\d{2,})\b", subj, re.IGNORECASE)
+            if m:
+                prefix = m.group(1)
+                digits = m.group(2)
+                norm = f"{prefix.upper()}-{digits}"
+                self.logger.info(f"Extracted internal job ID from subject: {norm}")
+                return norm
+
+            # Labeled Job ID: "Job ID: ABC-123"
+            m = re.search(r"Job[\s-]?ID[:\s]*([A-Za-z0-9\-_.]+)", subj, re.IGNORECASE)
+            if m:
+                return m.group(1).strip()
+
+            return None
+        except Exception:
+            return None
+
     def scrape_job_details(self, url: str) -> Dict[str, Any]:
         try:
             self.logger.info(f"Starting job scraping for URL: {url}")
@@ -415,11 +446,19 @@ class JobPosterAgent(BaseAgent):
             return None
 
     def _prepare_job_data(self, job_analysis: Dict[str, Any], job_url: str, email_data: EmailData) -> Dict[str, Any]:
-        job_id = self._extract_linkedin_job_id(job_url)
-        if not job_id:
-            self.logger.warning("Could not parse LinkedIn job ID, falling back to UUID.")
-            job_id = str(uuid.uuid4())
-        job_analysis['job_id'] = job_id
+        # Extract LinkedIn job id for the new field
+        linkedin_job_id = self._extract_linkedin_job_id(job_url)
+        if linkedin_job_id:
+            job_analysis['linkedin_job_id'] = linkedin_job_id
+        else:
+            self.logger.warning("Could not parse LinkedIn job ID from URL.")
+
+        # Derive internal job_id from subject (vendor token or labeled Job ID)
+        internal_job_id = self._extract_internal_job_id(getattr(email_data, 'subject', None))
+        if not internal_job_id:
+            self.logger.info("No internal job ID found in subject; generating a UUID as job_id.")
+            internal_job_id = str(uuid.uuid4())
+        job_analysis['job_id'] = internal_job_id
 
         embeddings = self._generate_embeddings(structured_data=job_analysis)
         job_analysis['embeddings'] = embeddings or []
@@ -934,8 +973,7 @@ Additional Information:
 
                 subject, body_html, _ = email_generation_result # Original to_email is ignored
 
-                # The 'from_email' is the agent's address, the 'to_email' is the original sender.
-                from_email = "bibhu@myhiringpartner.ai"
+                from_email = "support@myhiringpartner.ai"
                 to_email = email_data.sender
 
                 if not to_email:

@@ -528,12 +528,11 @@ class ResumeProcessorAgent(BaseAgent):
         if not subject or not isinstance(subject, str):
             return None
         try:
-            # Try to capture text after 'New application:' until '-MHP-' or ' from '
-            m = re.search(r'New application:\s*(?P<title>.*?)(?:\s*-MHP-\d+|\s+from\b|$)', subject, re.IGNORECASE)
+            cleaned = re.sub(r"[\[\]\(\)]", " ", subject)
+            m = re.search(r'New application:\s*(?P<title>.*?)(?:\s+[A-Za-z]{2,}[-_ ]?\d+|\s+from\b|$)', cleaned, re.IGNORECASE)
             if m:
                 return m.group('title').strip()
-            # Fallback: capture between colon and 'from'
-            m2 = re.search(r':\s*(?P<title>.*?)\s+from\b', subject, re.IGNORECASE)
+            m2 = re.search(r':\s*(?P<title>.*?)\s+from\b', cleaned, re.IGNORECASE)
             if m2:
                 return m2.group('title').strip()
             return None
@@ -545,7 +544,6 @@ class ResumeProcessorAgent(BaseAgent):
         temp_resume_path = None
         try:
             attachments = email_data.attachments
-            # Backward compatibility: construct attachment from top-level gcs_path if present
             if (not attachments) and getattr(email_data, 'gcs_path', None):
                 attachments = [{
                     'storage_path': getattr(email_data, 'gcs_path', None),
@@ -617,38 +615,7 @@ class ResumeProcessorAgent(BaseAgent):
             
             self.logger.info("Inserting resume record into BigQuery...")
             if self.save_resume_to_bq(analysis, embeddings, storage_uri):
-                # Persisted successfully. Do not perform essential-info follow-up here.
-                # The CoordinatorAgent will run matching (workflow2) and decide whether
-                # to trigger candidate follow-up based on the screening decision.
-                # --- New: if this resume came as a job application, attempt to resolve
-                # the job title in the email subject to a job_id and run matching
-                try:
-                    job_title = None
-                    if getattr(email_data, 'subject', None):
-                        job_title = self._extract_job_title_from_subject(email_data.subject)
-                    if job_title:
-                        self.logger.info(f"Detected job application for title: {job_title}. Looking up job_id...")
-                        try:
-                            ms = MatchingService()
-                            resolved_job_id = ms._find_job_id_by_title(job_title)
-                            if resolved_job_id:
-                                self.logger.info(f"Resolved job_id={resolved_job_id} for title '{job_title}'. Running matching workflow...")
-                                try:
-                                    match_results = ms.workflow2_resume_to_jds(candidate_id=candidate_id, job_id=resolved_job_id)
-                                    self.logger.info(f"Matching completed for candidate {candidate_id} vs job {resolved_job_id}")
-                                except Exception as me:
-                                    self.logger.error(f"Error running matching workflow for job_id={resolved_job_id}: {me}", exc_info=True)
-                                    match_results = {"status": "error", "message": str(me)}
-                            else:
-                                self.logger.info(f"No job found matching title '{job_title}' in job_details table.")
-                                match_results = None
-                        except Exception as e:
-                            self.logger.error(f"Failed to lookup job_id for title '{job_title}': {e}", exc_info=True)
-                            match_results = None
-                    else:
-                        match_results = None
-                except Exception:
-                    match_results = None
+                match_results = None
 
                 response = {
                     "status": "success",

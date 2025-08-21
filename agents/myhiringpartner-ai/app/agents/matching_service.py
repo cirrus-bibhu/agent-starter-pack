@@ -349,27 +349,46 @@ class MatchingService(BaseAgent):
 
         return dot_product / (magnitude1 * magnitude2)
 
-    def _fetch_jd_data(self, job_id):
+    def _fetch_jd_data(self, job_id_or_linkedin_id: str):
+        """Fetch a job_details row by internal job_id, with fallback to linkedin_job_id.
+
+        Backward-compatible: existing callers pass internal job_id. If that fails and the
+        input looks like a numeric LinkedIn ID, we try matching on linkedin_job_id.
+        Returns a dict row or None.
+        """
         try:
+            # 1) Try by internal job_id
             query = f"""
             SELECT * FROM `{self.project_id}.{self.dataset_id}.{self.jd_table_name}`
-            WHERE job_id = @job_id
+            WHERE job_id = @id
             LIMIT 1
             """
-
             job_config = bigquery.QueryJobConfig(
                 query_parameters=[
-                    bigquery.ScalarQueryParameter("job_id", "STRING", job_id)
+                    bigquery.ScalarQueryParameter("id", "STRING", job_id_or_linkedin_id)
                 ]
             )
+            results = list(self.bq_client.query(query, job_config=job_config).result())
+            if results:
+                return dict(results[0])
 
-            query_job = self.bq_client.query(query, job_config=job_config)
-            results = list(query_job.result())
+            # 2) Fallback: if input seems like a LinkedIn numeric id, try linkedin_job_id
+            if isinstance(job_id_or_linkedin_id, str) and job_id_or_linkedin_id.isdigit():
+                query2 = f"""
+                SELECT * FROM `{self.project_id}.{self.dataset_id}.{self.jd_table_name}`
+                WHERE linkedin_job_id = @lid
+                LIMIT 1
+                """
+                job_config2 = bigquery.QueryJobConfig(
+                    query_parameters=[
+                        bigquery.ScalarQueryParameter("lid", "STRING", job_id_or_linkedin_id)
+                    ]
+                )
+                results2 = list(self.bq_client.query(query2, job_config=job_config2).result())
+                if results2:
+                    return dict(results2[0])
 
-            if not results:
-                return None
-
-            return dict(results[0])
+            return None
         except Exception as e:
             raise Exception(f"Error fetching JD data: {str(e)}")
 

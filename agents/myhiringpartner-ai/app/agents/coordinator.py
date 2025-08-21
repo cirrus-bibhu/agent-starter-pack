@@ -435,22 +435,20 @@ class CoordinatorAgent(BaseAgent):
         import re
         try:
             subj = subject.strip()
+            subj = re.sub(r"[\[\]\(\)]", " ", subj)
 
-            # 1) Vendor/internal code, e.g. MHP-2528 or MHP2528 (capture prefix+digits)
-            m = re.search(r"\b([A-Za-z]{2,}-?\d{2,})\b", subj, re.IGNORECASE)
+            # 1) Vendor/internal code, e.g. MHP-2528 or MHP2528 or MHP 2528 (capture prefix+digits)
+            m = re.search(r"\b([A-Za-z]{2,})[-_ ]?(\d{2,})\b", subj, re.IGNORECASE)
             if m:
-                raw = m.group(1)
-                # normalize to PREFIX-<digits>
-                norm = re.sub(r"([A-Za-z]+)[-_]?(\d+)", lambda mo: f"{mo.group(1).upper()}-{mo.group(2)}", raw)
-                # Validate normalized token against job_details
+                prefix = m.group(1)
+                digits = m.group(2)
+                norm = f"{prefix.upper()}-{digits}"
                 try:
                     jd = self.matching_service._fetch_jd_data(norm)
                     if jd:
                         return norm
                 except Exception:
-                    # ignore validation errors and continue
                     pass
-                # Try plain digits fallback only for validation (in case job_id stored as just digits)
                 digits_m = re.search(r"(\d+)$", norm)
                 if digits_m:
                     digits = digits_m.group(1)
@@ -468,7 +466,8 @@ class CoordinatorAgent(BaseAgent):
                 try:
                     jd = self.matching_service._fetch_jd_data(linkedin_id)
                     if jd:
-                        return linkedin_id
+                        stored_id = jd.get('job_id') or linkedin_id
+                        return stored_id
                 except Exception:
                     pass
 
@@ -479,11 +478,10 @@ class CoordinatorAgent(BaseAgent):
                 try:
                     jd = self.matching_service._fetch_jd_data(token)
                     if jd:
-                        return token
+                        return jd.get('job_id') or token
                 except Exception:
                     pass
 
-            # If nothing validated, return None. Do NOT return a blind numeric match.
             return None
         except Exception:
             return None
@@ -560,42 +558,6 @@ class CoordinatorAgent(BaseAgent):
                 if hasattr(email_data, 'subject'):
                     job_id = self._extract_job_id_from_subject(email_data.subject)
 
-                try:
-                    if job_id and re.search(r"[A-Za-z]", str(job_id)):
-                        job_title_candidate = self._extract_job_title_from_subject(email_data.subject)
-                        if not job_title_candidate:
-                            m = re.search(r"new application[:\s-]*([^\-]+)(?:\s+-|\s+from\b|$)", email_data.subject, re.IGNORECASE)
-                            if m:
-                                job_title_candidate = m.group(1).strip()
-
-                        if job_title_candidate:
-                            try:
-                                resolved_job_id = self.matching_service._find_job_id_by_title(job_title_candidate)
-                                if resolved_job_id:
-                                    self.logger.info(f"Resolved vendor token '{job_id}' to stored job_id={resolved_job_id} using title '{job_title_candidate}'")
-                                    job_id = resolved_job_id
-                            except Exception as e:
-                                self.logger.debug(f"Error resolving job id from title '{job_title_candidate}': {e}")
-                except Exception:
-                    pass
-
-                # If no explicit job_id found earlier, try to extract a job title from the subject
-                # and resolve it to a job_id using MatchingService (existing behavior)
-                if not job_id and hasattr(email_data, 'subject'):
-                    try:
-                        job_title_candidate = self._extract_job_title_from_subject(email_data.subject)
-                        if job_title_candidate:
-                            resolved_job_id = None
-                            try:
-                                resolved_job_id = self.matching_service._find_job_id_by_title(job_title_candidate)
-                            except Exception as e:
-                                self.logger.debug(f"Error resolving job id from title '{job_title_candidate}': {e}")
-                            if resolved_job_id:
-                                job_id = resolved_job_id
-                                self.logger.info(f"Resolved job_id={job_id} from title '{job_title_candidate}'")
-                    except Exception:
-                        pass
-
                 if candidate_id:
                     try:
                         self.logger.info(
@@ -610,11 +572,11 @@ class CoordinatorAgent(BaseAgent):
                         try:
                             resume_full = self.matching_service._fetch_resume_data(candidate_id)
                             if resume_full:
-                                missing_items = []
-                                if not resume_full.get('linkedin_url'):
-                                    missing_items.append('LinkedIn Profile URL')
-                                if not resume_full.get('candidate_location'):
-                                    missing_items.append('Current Location')
+                                try:
+                                    from .followup_helper import get_missing_candidate_fields
+                                    missing_items = get_missing_candidate_fields(resume_full)
+                                except Exception:
+                                    missing_items = []
 
                                 # Only create follow-up drafts when at least one match has a screening status
                                 # that indicates we should proceed: Proceed Ahead / Move/Moving Forward / Requires Clarification
@@ -643,7 +605,6 @@ class CoordinatorAgent(BaseAgent):
                                         from_email = 'support@myhiringpartner.ai'
                                         if to_email:
                                             draft_id = draft_helper._save_email_as_draft(from_email, to_email, subject, body_html)
-                                            # annotate the matching result with follow-up metadata
                                             if isinstance(response.get('matching_result'), dict):
                                                 response['matching_result']['followup_created'] = True
                                                 response['matching_result']['followup_draft_id'] = draft_id
@@ -700,7 +661,7 @@ class CoordinatorAgent(BaseAgent):
         
         email_template = f"""Subject: Regarding Job Posting: {job_analysis.get('job_title')}
 
-Hi Bibhu,
+Hi,
 
 Thank you for sharing the job opportunity for the {job_analysis.get('job_title')} position at {job_analysis.get('end_client_name')}.
 
@@ -736,25 +697,12 @@ MyHiringPartner.ai"""
         return email_template
 
     def _generate_candidate_followup_email(self, candidate_name: str, missing_fields: list[str], job_id: Optional[str] = None) -> tuple[str, str]:
-        """Generate a concise follow-up email requesting missing candidate info.
+        """Generate a structured follow-up email using centralized email template renderer.
 
         Returns (subject, body_html).
         """
-        safe_name = (candidate_name or "there").strip()
-        subject = "Quick details to complete your profile" + (f" (Job {job_id})" if job_id else "")
-        bullet_items = "".join([f"<li>{field.title()}</li>" for field in missing_fields])
-        body_html = f"""
-        <div style='font-family: Arial, sans-serif; font-size:14px; line-height:1.5;'>
-          <p>Hi {safe_name},</p>
-          <p>Thanks for sharing your resume. To complete your profile and proceed efficiently, could you please provide the following:</p>
-          <ul>
-            {bullet_items}
-          </ul>
-          <p>You can simply reply to this email with the details. If you already shared any of these, feel free to ignore those items.</p>
-          <p>Thank you!<br/>MyHiringPartner AI</p>
-        </div>
-        """
-        return subject, body_html
+        from .email_templates import render_candidate_followup_email
+        return render_candidate_followup_email(candidate_name, missing_fields, job_id, "fillable_table")
 
     def run(self, email_json: str, **kwargs) -> Dict[str, Any]:
         try:

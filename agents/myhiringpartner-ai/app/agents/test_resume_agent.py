@@ -56,9 +56,29 @@ def test_resume_email_processing():
     with open(SAMPLE_DOC, 'rb') as f:
         resume_bytes = f.read()
 
+    # 1) First, simulate a job posting email so the job exists in job_details
+    posting_email = {
+        "id": "email_job_post_001",
+        "subject": "Your job is posted: [Application Lead-MHP 2529]",
+        "body": """
+Dear Hiring Team,
+
+Please review the details for our new job opening.
+This is an urgent hire for our division.
+The full job description can be found here: https://www.linkedin.com/jobs/view/4259823054
+
+Thanks,
+Recruiter
+""",
+        "sender": "recruiter@example.com",
+        "recipient": "support@myhiringpartner.ai",
+        "timestamp": "2025-08-19T10:00:00Z"
+    }
+
+    # 2) Then, simulate an application email that references the same internal job id in the subject
     resume_email = {
         "id": "email_resume_app_001",
-        "subject": "Resume Application for Position Production Agent - L1",
+        "subject": "New application: Application Lead-MHP2529 from John Doe",
         "body": """
 Dear Hiring Team,
 

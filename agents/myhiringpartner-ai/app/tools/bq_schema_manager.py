@@ -7,6 +7,7 @@ logger = logging.getLogger('Agent.SchemaManager')
 # Definitive schema for the job_details table
 JOB_DETAILS_SCHEMA = [
     bigquery.SchemaField("job_id", "STRING", mode="REQUIRED"),
+    bigquery.SchemaField("linkedin_job_id", "STRING", mode="NULLABLE"),
     bigquery.SchemaField("customer_type", "STRING", mode="REQUIRED"),
     bigquery.SchemaField("recruiter_email", "STRING", mode="REQUIRED"),
     bigquery.SchemaField("prime_vendor_email", "STRING", mode="NULLABLE"),
@@ -178,8 +179,28 @@ def ensure_table_exists(client: bigquery.Client, table_id: str) -> None:
         raise ValueError(f"No schema defined for table {table_name}")
 
     try:
-        client.get_table(table_id)
+        table = client.get_table(table_id)
         logger.info(f"Table {table_id} already exists.")
+
+        # Lightweight schema evolution: add any missing top-level columns present in our definitive schema
+        try:
+            existing_fields = {f.name: f for f in table.schema}
+            desired_fields = {f.name: f for f in schema}
+
+            missing = [name for name in desired_fields.keys() if name not in existing_fields]
+            for name in missing:
+                field = desired_fields[name]
+                # Only support adding simple top-level fields (non-RECORD) here
+                if field.field_type != 'RECORD':
+                    ddl = (
+                        f"ALTER TABLE `{table_id}` "
+                        f"ADD COLUMN IF NOT EXISTS `{field.name}` {field.field_type}"
+                        + (" REPEATED" if field.mode == 'REPEATED' else "")
+                    )
+                    logger.info(f"Applying schema update: {ddl}")
+                    client.query(ddl).result()
+        except Exception as se:
+            logger.warning(f"Schema evolution check failed for {table_id}: {se}")
     except exceptions.NotFound:
         logger.warning(f"Table {table_id} not found. Creating it now.")
         try:
